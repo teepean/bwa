@@ -26,7 +26,7 @@
 */
 #include <zlib.h>
 #include <stdio.h>
-#include <unistd.h>
+#include "port.h"
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
@@ -82,7 +82,7 @@ static void *process(void *shared, int step, void *_data)
 			}
 		for (i = 0; i < ret->n_seqs; ++i) size += ret->seqs[i].l_seq;
 		if (bwa_verbose >= 3)
-			fprintf(stderr, "[M::%s] read %d sequences (%ld bp)...\n", __func__, ret->n_seqs, (long)size);
+			fprintf(stderr, "[M::%s] read %d sequences (%ld bp)...\n", __FUNCTION__, ret->n_seqs, (long)size);
 		return ret;
 	} else if (step == 1) {
 		const mem_opt_t *opt = aux->opt;
@@ -93,7 +93,7 @@ static void *process(void *shared, int step, void *_data)
 			mem_opt_t tmp_opt = *opt;
 			bseq_classify(data->n_seqs, data->seqs, n_sep, sep);
 			if (bwa_verbose >= 3)
-				fprintf(stderr, "[M::%s] %d single-end sequences; %d paired-end sequences\n", __func__, n_sep[0], n_sep[1]);
+				fprintf(stderr, "[M::%s] %d single-end sequences; %d paired-end sequences\n", __FUNCTION__, n_sep[0], n_sep[1]);
 			if (n_sep[0]) {
 				tmp_opt.flag &= ~MEM_F_PE;
 				mem_process_seqs(&tmp_opt, idx->bwt, idx->bns, idx->pac, aux->n_processed, n_sep[0], sep[0], 0);
@@ -141,7 +141,11 @@ static void update_a(mem_opt_t *opt, const mem_opt_t *opt0)
 int main_mem(int argc, char *argv[])
 {
 	mem_opt_t *opt, opt0;
-	int fd, fd2, i, c, ignore_alt = 0, no_mt_io = 0;
+#ifndef WINDOWS_PORT
+ 	int fd, fd2, i, c, ignore_alt = 0, no_mt_io = 0;
+#else
+	int i, c, ignore_alt = 0, no_mt_io = 0;
+#endif
 	int fixed_chunk_size = -1;
 	gzFile fp, fp2 = 0;
 	char *p, *rg_line = 0, *hdr_line = 0;
@@ -253,7 +257,7 @@ int main_mem(int argc, char *argv[])
 				pes[1].low  = (int)(strtod(p+1, &p) + .499);
 			if (bwa_verbose >= 3)
 				fprintf(stderr, "[M::%s] mean insert size: %.3f, stddev: %.3f, max: %d, min: %d\n",
-						__func__, pes[1].avg, pes[1].std, pes[1].high, pes[1].low);
+						__FUNCTION__, pes[1].avg, pes[1].std, pes[1].high, pes[1].low);
 		}
 		else return 1;
 	}
@@ -353,39 +357,47 @@ int main_mem(int argc, char *argv[])
 				if (!opt0.pen_clip3) opt->pen_clip3 = 0;
 			}
 		} else {
-			fprintf(stderr, "[E::%s] unknown read type '%s'\n", __func__, mode);
+			fprintf(stderr, "[E::%s] unknown read type '%s'\n", __FUNCTION__, mode);
 			return 1; // FIXME memory leak
 		}
 	} else update_a(opt, &opt0);
 	bwa_fill_scmat(opt->a, opt->b, opt->mat);
 
-	aux.idx = bwa_idx_load_from_shm(argv[optind]);
+	aux.idx = bwa_idx_load(argv[optind], BWA_IDX_ALL);
 	if (aux.idx == 0) {
 		if ((aux.idx = bwa_idx_load(argv[optind], BWA_IDX_ALL)) == 0) return 1; // FIXME: memory leak
 	} else if (bwa_verbose >= 3)
-		fprintf(stderr, "[M::%s] load the bwa index from shared memory\n", __func__);
+		fprintf(stderr, "[M::%s] load the bwa index from shared memory\n", __FUNCTION__);
 	if (ignore_alt)
 		for (i = 0; i < aux.idx->bns->n_seqs; ++i)
 			aux.idx->bns->anns[i].is_alt = 0;
 
+#ifndef WINDOWS_PORT
 	ko = kopen(argv[optind + 1], &fd);
 	if (ko == 0) {
-		if (bwa_verbose >= 1) fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, argv[optind + 1]);
+		if (bwa_verbose >= 1) fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __FUNCTION__, argv[optind + 1]);
 		return 1;
 	}
 	fp = gzdopen(fd, "r");
+#else
+	fp = gzopen(argv[optind + 1], "r");
+#endif
 	aux.ks = kseq_init(fp);
 	if (optind + 2 < argc) {
 		if (opt->flag&MEM_F_PE) {
 			if (bwa_verbose >= 2)
-				fprintf(stderr, "[W::%s] when '-p' is in use, the second query file is ignored.\n", __func__);
+				fprintf(stderr, "[W::%s] when '-p' is in use, the second query file is ignored.\n", __FUNCTION__);
 		} else {
+#ifndef WINDOWS_PORT
 			ko2 = kopen(argv[optind + 2], &fd2);
 			if (ko2 == 0) {
-				if (bwa_verbose >= 1) fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, argv[optind + 2]);
+				if (bwa_verbose >= 1) fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __FUNCTION__, argv[optind + 2]);
 				return 1;
 			}
 			fp2 = gzdopen(fd2, "r");
+#else
+			fp2 = gzopen(argv[optind + 2], "r");
+#endif
 			aux.ks2 = kseq_init(fp2);
 			opt->flag |= MEM_F_PE;
 		}
@@ -397,10 +409,19 @@ int main_mem(int argc, char *argv[])
 	free(opt);
 	bwa_idx_destroy(aux.idx);
 	kseq_destroy(aux.ks);
+//vittu
+#ifndef WINDOWS_PORT
 	err_gzclose(fp); kclose(ko);
+#else
+	err_gzclose(fp);
+#endif
 	if (aux.ks2) {
 		kseq_destroy(aux.ks2);
+#ifndef WINDOWS_PORT
 		err_gzclose(fp2); kclose(ko2);
+#else
+		err_gzclose(fp2);
+#endif
 	}
 	return 0;
 }

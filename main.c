@@ -48,10 +48,10 @@ int bwa_bwtsw2(int argc, char *argv[]);
 
 int main_fastmap(int argc, char *argv[]);
 int main_mem(int argc, char *argv[]);
-int main_shm(int argc, char *argv[]);
+// int main_shm(int argc, char *argv[]);
 
 int main_pemerge(int argc, char *argv[]);
-int main_maxk(int argc, char *argv[]);
+// int main_maxk(int argc, char *argv[]);
 	
 static int usage()
 {
@@ -109,9 +109,9 @@ int main(int argc, char *argv[])
 	else if (strcmp(argv[1], "bwasw") == 0) ret = bwa_bwtsw2(argc-1, argv+1);
 	else if (strcmp(argv[1], "fastmap") == 0) ret = main_fastmap(argc-1, argv+1);
 	else if (strcmp(argv[1], "mem") == 0) ret = main_mem(argc-1, argv+1);
-	else if (strcmp(argv[1], "shm") == 0) ret = main_shm(argc-1, argv+1);
+//	else if (strcmp(argv[1], "shm") == 0) ret = main_shm(argc-1, argv+1);
 	else if (strcmp(argv[1], "pemerge") == 0) ret = main_pemerge(argc-1, argv+1);
-	else if (strcmp(argv[1], "maxk") == 0) ret = main_maxk(argc-1, argv+1);
+//	else if (strcmp(argv[1], "maxk") == 0) ret = main_maxk(argc-1, argv+1);
 	else {
 		fprintf(stderr, "[main] unrecognized command '%s'\n", argv[1]);
 		return 1;
@@ -119,11 +119,11 @@ int main(int argc, char *argv[])
 	err_fflush(stdout);
 	err_fclose(stdout);
 	if (ret == 0) {
-		fprintf(stderr, "[%s] Version: %s\n", __func__, PACKAGE_VERSION);
-		fprintf(stderr, "[%s] CMD:", __func__);
+		fprintf(stderr, "[%s] Version: %s\n", __FUNCTION__, PACKAGE_VERSION);
+		fprintf(stderr, "[%s] CMD:", __FUNCTION__);
 		for (i = 0; i < argc; ++i)
 			fprintf(stderr, " %s", argv[i]);
-		fprintf(stderr, "\n[%s] Real time: %.3f sec; CPU: %.3f sec\n", __func__, realtime() - t_real, cputime());
+		fprintf(stderr, "\n[%s] Real time: %.3f sec; CPU: %.3f sec\n", __FUNCTION__, realtime() - t_real, cputime());
 	}
 	free(bwa_pg);
 	return ret;

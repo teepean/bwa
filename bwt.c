@@ -50,7 +50,7 @@ void bwt_gen_cnt_table(bwt_t *bwt)
 	}
 }
 
-static inline bwtint_t bwt_invPsi(const bwt_t *bwt, bwtint_t k) // compute inverse CSA
+static myinline bwtint_t bwt_invPsi(const bwt_t *bwt, bwtint_t k) // compute inverse CSA
 {
 	bwtint_t x = k - (k > bwt->primary);
 	x = bwt_B0(bwt, x);
@@ -95,7 +95,7 @@ bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
 	return sa + bwt->sa[k/bwt->sa_intv];
 }
 
-static inline int __occ_aux(uint64_t y, int c)
+static myinline int __occ_aux(uint64_t y, int c)
 {
 	// reduce nucleotide counting to bits counting
 	y = ((c&2)? y : ~y) >> 1 & ((c&1)? y : ~y) & 0x5555555555555555ull;
@@ -410,9 +410,11 @@ static bwtint_t fread_fix(FILE *fp, bwtint_t size, void *a)
 { // Mac/Darwin has a bug when reading data longer than 2GB. This function fixes this issue by reading data in small chunks
 	const int bufsize = 0x1000000; // 16M block
 	bwtint_t offset = 0;
+	char* char_ptr = (char*)a;  // Cast void pointer to char pointer
+
 	while (size) {
-		int x = bufsize < size? bufsize : size;
-		if ((x = err_fread_noeof(a + offset, 1, x, fp)) == 0) break;
+		int x = bufsize < size ? bufsize : size;
+		if ((x = err_fread_noeof(char_ptr + offset, 1, x, fp)) == 0) break;
 		size -= x; offset += x;
 	}
 	return offset;
@@ -447,8 +449,10 @@ bwt_t *bwt_restore_bwt(const char *fn)
 
 	bwt = (bwt_t*)calloc(1, sizeof(bwt_t));
 	fp = xopen(fn, "rb");
+//	err_fseek(fp, 0, SEEK_END);
+//	bwt->bwt_size = (err_ftell(fp) - sizeof(bwtint_t) * 5) >> 2;
 	err_fseek(fp, 0, SEEK_END);
-	bwt->bwt_size = (err_ftell(fp) - sizeof(bwtint_t) * 5) >> 2;
+	bwt->bwt_size = (portable_ftell(fp) - sizeof(bwtint_t) * 5) >> 2;
 	bwt->bwt = (uint32_t*)calloc(bwt->bwt_size, 4);
 	err_fseek(fp, 0, SEEK_SET);
 	err_fread_noeof(&bwt->primary, sizeof(bwtint_t), 1, fp);

@@ -27,7 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include "port.h"
 #include <time.h>
 #include <zlib.h>
 #include "bntseq.h"
@@ -54,8 +54,8 @@ int64_t bwa_seq_len(const char *fn_pac)
 	int64_t pac_len;
 	ubyte_t c;
 	fp = xopen(fn_pac, "rb");
-	err_fseek(fp, -1, SEEK_END);
-	pac_len = err_ftell(fp);
+	portable_fseek(fp, -1, SEEK_END);
+	pac_len = portable_ftell(fp);
 	err_fread_noeof(&c, 1, 1, fp);
 	err_fclose(fp);
 	return (pac_len - 1) * 4 + (int)c;
@@ -216,7 +216,7 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 			if (strcmp(optarg, "rb2") == 0) algo_type = BWTALGO_RB2;
 			else if (strcmp(optarg, "bwtsw") == 0) algo_type = BWTALGO_BWTSW;
 			else if (strcmp(optarg, "is") == 0) algo_type = BWTALGO_IS;
-			else err_fatal(__func__, "unknown algorithm: '%s'.", optarg);
+			else err_fatal(__FUNCTION__, "unknown algorithm: '%s'.", optarg);
 			break;
 		case 'p': prefix = strdup(optarg); break;
 		case '6': is_64 = 1; break;

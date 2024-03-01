@@ -29,6 +29,7 @@
 #include "bwamem.h"
 #include "bntseq.h"
 #include "kstring.h"
+#include "port.h"
 
 /***************************
  * SMEM iterator interface *
@@ -113,7 +114,7 @@ mem_alnreg_v mem_align1(const mem_opt_t *opt, const bwt_t *bwt, const bntseq_t *
 	return ar;
 }
 
-static inline int get_pri_idx(double XA_drop_ratio, const mem_alnreg_t *a, int i)
+static myinline int get_pri_idx(double XA_drop_ratio, const mem_alnreg_t *a, int i)
 {
 	int k = a[i].secondary_all;
 	if (k >= 0 && a[i].score >= a[k].score * XA_drop_ratio) return k;

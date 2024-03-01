@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "port.h"
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
@@ -20,7 +21,7 @@ typedef struct __kstring_t {
 } kstring_t;
 #endif
 
-static inline void ks_resize(kstring_t *s, size_t size)
+static myinline void ks_resize(kstring_t *s, size_t size)
 {
 	if (s->m < size) {
 		s->m = size;
@@ -29,7 +30,7 @@ static inline void ks_resize(kstring_t *s, size_t size)
 	}
 }
 
-static inline int kputsn(const char *p, int l, kstring_t *s)
+static myinline int kputsn(const char *p, int l, kstring_t *s)
 {
 	if (s->l + l + 1 >= s->m) {
 		s->m = s->l + l + 2;
@@ -42,12 +43,12 @@ static inline int kputsn(const char *p, int l, kstring_t *s)
 	return l;
 }
 
-static inline int kputs(const char *p, kstring_t *s)
+static myinline int kputs(const char *p, kstring_t *s)
 {
 	return kputsn(p, strlen(p), s);
 }
 
-static inline int kputc(int c, kstring_t *s)
+static myinline int kputc(int c, kstring_t *s)
 {
 	if (s->l + 1 >= s->m) {
 		s->m = s->l + 2;
@@ -59,7 +60,7 @@ static inline int kputc(int c, kstring_t *s)
 	return c;
 }
 
-static inline int kputw(int c, kstring_t *s)
+static myinline int kputw(int c, kstring_t *s)
 {
 	char buf[16];
 	int l, x;
@@ -76,7 +77,7 @@ static inline int kputw(int c, kstring_t *s)
 	return 0;
 }
 
-static inline int kputuw(unsigned c, kstring_t *s)
+static myinline int kputuw(unsigned c, kstring_t *s)
 {
 	char buf[16];
 	int l, i;
@@ -93,7 +94,7 @@ static inline int kputuw(unsigned c, kstring_t *s)
 	return 0;
 }
 
-static inline int kputl(long c, kstring_t *s)
+static myinline int kputl(long c, kstring_t *s)
 {
 	char buf[32];
 	long l, x;

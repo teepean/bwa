@@ -62,6 +62,7 @@ typedef struct {
 
 extern int bwa_verbose, bwa_dbg;
 extern char bwa_rg_id[256];
+extern char bwa_pg;
 
 #ifdef __cplusplus
 extern "C" {

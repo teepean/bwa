@@ -30,6 +30,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <zlib.h>
+#include "port.h"
 
 #ifdef __GNUC__
 // Tell GCC to validate printf format string and args
@@ -38,14 +39,14 @@
 #define ATTRIBUTE(list)
 #endif
 
-#define err_fatal_simple(msg) _err_fatal_simple(__func__, msg)
-#define err_fatal_simple_core(msg) _err_fatal_simple_core(__func__, msg)
+#define err_fatal_simple(msg) _err_fatal_simple(__FUNCTION__, msg)
+#define err_fatal_simple_core(msg) _err_fatal_simple_core(__FUNCTION__, msg)
 
-#define xopen(fn, mode) err_xopen_core(__func__, fn, mode)
-#define xreopen(fn, mode, fp) err_xreopen_core(__func__, fn, mode, fp)
-#define xzopen(fn, mode) err_xzopen_core(__func__, fn, mode)
+#define xopen(fn, mode) err_xopen_core(__FUNCTION__, fn, mode)
+#define xreopen(fn, mode, fp) err_xreopen_core(__FUNCTION__, fn, mode, fp)
+#define xzopen(fn, mode) err_xzopen_core(__FUNCTION__, fn, mode)
 
-#define xassert(cond, msg) if ((cond) == 0) _err_fatal_simple_core(__func__, msg)
+#define xassert(cond, msg) if ((cond) == 0) _err_fatal_simple_core(__FUNCTION__, msg)
 
 typedef struct {
 	uint64_t x, y;
@@ -86,7 +87,7 @@ extern "C" {
 
 	double cputime(void);
 	double realtime(void);
-	long peakrss(void);
+//	long peakrss(void);
 
 	void ks_introsort_64 (size_t n, uint64_t *a);
 	void ks_introsort_128(size_t n, pair64_t *a);

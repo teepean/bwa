@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <assert.h>
+#define __SSE2__
 #if defined __SSE2__
 #include <emmintrin.h>
 #elif defined __ARM_NEON
@@ -34,6 +35,7 @@
 #include "scalar_sse.h"
 #endif
 #include "ksw.h"
+#include "port.h"
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
@@ -369,7 +371,7 @@ end_loop8:
 	return r;
 }
 
-static inline void revseq(int l, uint8_t *s)
+static myinline void revseq(int l, uint8_t *s)
 {
 	int i, t;
 	for (i = 0; i < l>>1; ++i)
@@ -525,7 +527,7 @@ int ksw_extend(int qlen, const uint8_t *query, int tlen, const uint8_t *target, 
 
 #define MINUS_INF -0x40000000
 
-static inline uint32_t *push_cigar(int *n_cigar, int *m_cigar, uint32_t *cigar, int op, int len)
+static myinline uint32_t *push_cigar(int *n_cigar, int *m_cigar, uint32_t *cigar, int op, int len)
 {
 	if (*n_cigar == 0 || op != (cigar[(*n_cigar) - 1]&0xf)) {
 		if (*n_cigar == *m_cigar) {

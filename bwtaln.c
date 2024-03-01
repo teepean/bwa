@@ -1,5 +1,5 @@
 #include <stdio.h>
-#include <unistd.h>
+#include "port.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,10 +12,6 @@
 #include "bwtgap.h"
 #include "utils.h"
 #include "bwa.h"
-
-#ifdef HAVE_PTHREAD
-#include <pthread.h>
-#endif
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
@@ -156,6 +152,11 @@ bwa_seqio_t *bwa_open_reads(int mode, const char *fn_fa)
 	return ks;
 }
 
+#ifdef WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
+
 void bwa_aln_core(const char *prefix, const char *fn_fa, const gap_opt_t *opt)
 {
 	int i, n_seqs;
@@ -173,6 +174,14 @@ void bwa_aln_core(const char *prefix, const char *fn_fa, const gap_opt_t *opt)
 		strcpy(str, prefix); strcat(str, ".bwt");  bwt = bwt_restore_bwt(str);
 		free(str);
 	}
+
+#ifdef WIN32
+	// patch for windows by chuntao
+	// by default, stdout is opened in text mode, when fwrite, two 0x0D will be 
+	// automatically placed in stdout, causing file corruption
+	// setting mode to binary will fix the problem
+	_setmode(_fileno(stdout), _O_BINARY);
+#endif
 
 	// core loop
 	err_fwrite(SAI_MAGIC, 1, 4, stdout);
@@ -311,7 +320,7 @@ int bwa_aln(int argc, char *argv[])
 		}
 	}
 	if ((prefix = bwa_idx_infer_prefix(argv[optind])) == 0) {
-		fprintf(stderr, "[%s] fail to locate the index\n", __func__);
+		fprintf(stderr, "[%s] fail to locate the index\n", __FUNCTION__);
 		free(opt);
 		return 1;
 	}

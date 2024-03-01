@@ -5,6 +5,7 @@
 #include <zlib.h>
 #include "rle.h"
 #include "rope.h"
+#include "port.h"
 
 /*******************
  *** Memory Pool ***
@@ -35,7 +36,7 @@ static void mp_destroy(mempool_t *mp)
 	free(mp->mem); free(mp);
 }
 
-static inline void *mp_alloc(mempool_t *mp)
+static myinline void *mp_alloc(mempool_t *mp)
 {
 	if (mp->i == mp->n_elems) {
 		if (++mp->top == mp->max) {
@@ -75,7 +76,7 @@ void rope_destroy(rope_t *rope)
 	free(rope);
 }
 
-static inline rpnode_t *split_node(rope_t *rope, rpnode_t *u, rpnode_t *v)
+static myinline rpnode_t *split_node(rope_t *rope, rpnode_t *u, rpnode_t *v)
 { // split $v's child. $u is the first node in the bucket. $v and $u are in the same bucket. IMPORTANT: there is always enough room in $u
 	int j, i = v - u;
 	rpnode_t *w; // $w is the sibling of $v

@@ -24,7 +24,7 @@
    CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
    SOFTWARE.
 */
-#define FSYNC_ON_FLUSH
+// #define FSYNC_ON_FLUSH
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -32,13 +32,7 @@
 #include <string.h>
 #include <zlib.h>
 #include <errno.h>
-#ifdef FSYNC_ON_FLUSH
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-#include <sys/resource.h>
-#include <sys/time.h>
+#include "port.h"
 #include "utils.h"
 
 #include "ksort.h"
@@ -177,9 +171,10 @@ int err_printf(const char *format, ...)
 {
 	va_list arg;
 	int done;
+	int saveErrno;
 	va_start(arg, format);
 	done = vfprintf(stdout, format, arg);
-	int saveErrno = errno;
+	saveErrno = errno;
 	va_end(arg);
 	if (done < 0) _err_fatal_simple("vfprintf(stdout)", strerror(saveErrno));
 	return done;
@@ -189,9 +184,10 @@ int err_fprintf(FILE *stream, const char *format, ...)
 {
 	va_list arg;
 	int done;
+	int saveErrno;
 	va_start(arg, format);
 	done = vfprintf(stream, format, arg);
-	int saveErrno = errno;
+	saveErrno = errno;
 	va_end(arg);
 	if (done < 0) _err_fatal_simple("vfprintf", strerror(saveErrno));
 	return done;
@@ -294,6 +290,7 @@ double realtime(void)
 	return tp.tv_sec + tp.tv_usec * 1e-6;
 }
 
+#ifndef WIN32
 long peakrss(void)
 {
 	struct rusage r;
@@ -304,3 +301,4 @@ long peakrss(void)
 	return r.ru_maxrss;
 #endif
 }
+#endif

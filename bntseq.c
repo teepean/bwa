@@ -28,7 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
-#include <unistd.h>
+#include "port.h"
 #include <errno.h>
 #include "bntseq.h"
 #include "utils.h"

@@ -30,9 +30,7 @@
 #include <assert.h>
 #include <limits.h>
 #include <math.h>
-#ifdef HAVE_PTHREAD
-#include <pthread.h>
-#endif
+#include "port.h"
 
 #include "kstring.h"
 #include "bwamem.h"
@@ -644,7 +642,7 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
  * Construct the alignment from a chain *
  ****************************************/
 
-static inline int cal_max_gap(const mem_opt_t *opt, int qlen)
+static myinline int cal_max_gap(const mem_opt_t *opt, int qlen)
 {
 	int l_del = (int)((double)(qlen * opt->a - opt->o_del) / opt->e_del + 1.);
 	int l_ins = (int)((double)(qlen * opt->a - opt->o_ins) / opt->e_ins + 1.);
@@ -815,7 +813,7 @@ void mem_chain2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
  * Basic hit->SAM conversion *
  *****************************/
 
-static inline int infer_bw(int l1, int l2, int score, int a, int q, int r)
+static myinline int infer_bw(int l1, int l2, int score, int a, int q, int r)
 {
 	int w;
 	if (l1 == l2 && l1 * a - score < (q + r - a)<<1) return 0; // to get equal alignment length, we need at least two gaps
@@ -824,7 +822,7 @@ static inline int infer_bw(int l1, int l2, int score, int a, int q, int r)
 	return w;
 }
 
-static inline int get_rlen(int n_cigar, const uint32_t *cigar)
+static myinline int get_rlen(int n_cigar, const uint32_t *cigar)
 {
 	int k, l;
 	for (k = l = 0; k < n_cigar; ++k) {
@@ -835,7 +833,7 @@ static inline int get_rlen(int n_cigar, const uint32_t *cigar)
 	return l;
 }
 
-static inline void add_cigar(const mem_opt_t *opt, mem_aln_t *p, kstring_t *str, int which)
+static myinline void add_cigar(const mem_opt_t *opt, mem_aln_t *p, kstring_t *str, int which)
 {
 	int i;
 	if (p->n_cigar) { // aligned

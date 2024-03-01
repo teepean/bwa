@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include "QSufSort.h"
+#include "port.h"
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
@@ -377,7 +378,7 @@ BWTInc *BWTIncCreate(const bgint_t textLength, unsigned int initialMaxBuildSize,
 		+ OCC_INTERVAL / BIT_PER_CHAR * n_iter * 2 * (sizeof(bgint_t) / 4) // buffer at the end of occ array 
 		+ incMaxBuildSize/5 * 3 * (sizeof(bgint_t) / 4); // space for the 3 temporary arrays in each iteration
 	if (bwtInc->availableWord < MIN_AVAILABLE_WORD) bwtInc->availableWord = MIN_AVAILABLE_WORD; // lh3: otherwise segfaul when availableWord is too small
-	fprintf(stderr, "[%s] textLength=%ld, availableWord=%ld\n", __func__, (long)textLength, (long)bwtInc->availableWord);
+	fprintf(stderr, "[%s] textLength=%ld, availableWord=%ld\n", __FUNCTION__, (long)textLength, (long)bwtInc->availableWord);
 	bwtInc->workingMemory = (unsigned*)calloc(bwtInc->availableWord, BYTES_IN_WORD);
 
 	return bwtInc;
@@ -532,7 +533,7 @@ static void BWTIncBuildPackedBwt(const bgint_t *relativeRank, unsigned int* __re
 	}
 }
 
-static inline bgint_t BWTOccValueExplicit(const BWT *bwt, const bgint_t occIndexExplicit,
+static myinline bgint_t BWTOccValueExplicit(const BWT *bwt, const bgint_t occIndexExplicit,
 											   const unsigned int character)
 {
 	bgint_t occIndexMajor;
@@ -1454,12 +1455,12 @@ BWTInc *BWTIncConstructFromPacked(const char *inputFileName, bgint_t initialMaxB
 		exit(1);
 	}
 
-	if (fseek(packedFile, -1, SEEK_END) != 0) {
+	if (err_fseek(packedFile, -1, SEEK_END) != 0) {
 		fprintf(stderr, "BWTIncConstructFromPacked() : Can't seek on %s : %s\n",
 				inputFileName, strerror(errno));
 		exit(1);
 	}
-	packedFileLen = ftell(packedFile);
+	packedFileLen = portable_ftell(packedFile);
 	if (packedFileLen == -1) {
 		fprintf(stderr, "BWTIncConstructFromPacked() : Can't ftell on %s : %s\n",
 				inputFileName, strerror(errno));
@@ -1485,7 +1486,7 @@ BWTInc *BWTIncConstructFromPacked(const char *inputFileName, bgint_t initialMaxB
 	}
 	textSizeInByte = textToLoad / CHAR_PER_BYTE;	// excluded the odd byte
 
-	if (fseek(packedFile, -((long)textSizeInByte + 2), SEEK_CUR) != 0) {
+	if (err_fseek(packedFile, -((long)textSizeInByte + 2), SEEK_CUR) != 0) {
 		fprintf(stderr, "BWTIncConstructFromPacked() : Can't seek on %s : %s\n",
 				inputFileName, strerror(errno));
 		exit(1);
@@ -1497,7 +1498,7 @@ BWTInc *BWTIncConstructFromPacked(const char *inputFileName, bgint_t initialMaxB
 				ferror(packedFile)? strerror(errno) : "Unexpected end of file");
 		exit(1);
 	}
-	if (fseek(packedFile, -((long)textSizeInByte + 1), SEEK_CUR) != 0) {
+	if (err_fseek(packedFile, -((long)textSizeInByte + 1), SEEK_CUR) != 0) {
 		fprintf(stderr, "BWTIncConstructFromPacked() : Can't seek on %s : %s\n",
 				inputFileName, strerror(errno));
 		exit(1);
@@ -1514,7 +1515,7 @@ BWTInc *BWTIncConstructFromPacked(const char *inputFileName, bgint_t initialMaxB
 			textToLoad = totalTextLength - processedTextLength;
 		}
 		textSizeInByte = textToLoad / CHAR_PER_BYTE;
-		if (fseek(packedFile, -((long)textSizeInByte), SEEK_CUR) != 0) {
+		if (err_fseek(packedFile, -((long)textSizeInByte), SEEK_CUR) != 0) {
 			fprintf(stderr, "BWTIncConstructFromPacked() : Can't seek on %s : %s\n",
 					inputFileName, strerror(errno));
 			exit(1);
@@ -1526,7 +1527,7 @@ BWTInc *BWTIncConstructFromPacked(const char *inputFileName, bgint_t initialMaxB
 				ferror(packedFile)? strerror(errno) : "Unexpected end of file");
 			exit(1);
 		}
-		if (fseek(packedFile, -((long)textSizeInByte), SEEK_CUR) != 0) {
+		if (err_fseek(packedFile, -((long)textSizeInByte), SEEK_CUR) != 0) {
 			fprintf(stderr, "BWTIncConstructFromPacked() : Can't seek on %s : %s\n",
 					inputFileName, strerror(errno));
 			exit(1);
