@@ -1,10 +1,75 @@
+#ifndef _WIN32
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
+#else
+#include <windows.h>
+#include <io.h>
+#include <stdio.h>
+#ifndef PATH_MAX
+#define PATH_MAX MAX_PATH
+#endif
+typedef int mode_t;
+typedef long off_t;
+// Windows shared memory mappings
+#define MAP_SHARED 0x01
+#define PROT_READ 0x1
+#define PROT_WRITE 0x2
+#define O_CREAT 0x40
+#define O_EXCL 0x80
+#define O_RDWR 0x2
+#define O_RDONLY 0x0
+
+// Windows implementations
+static HANDLE shm_handles[256] = {0};
+static int shm_counter = 0;
+
+static int shm_open(const char *name, int oflag, mode_t mode) {
+	HANDLE handle;
+	DWORD access = GENERIC_READ;
+	DWORD create = OPEN_EXISTING;
+
+	if (oflag & O_RDWR) access = GENERIC_READ | GENERIC_WRITE;
+	if (oflag & O_CREAT) create = OPEN_ALWAYS;
+	if (oflag & O_EXCL) create = CREATE_NEW;
+
+	char win_name[256];
+	snprintf(win_name, sizeof(win_name), "Global\\bwa_%s", name + 1); // skip '/'
+
+	handle = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 0, win_name);
+	if (!handle) return -1;
+
+	int id = shm_counter++;
+	shm_handles[id] = handle;
+	return id;
+}
+
+#define MAP_FAILED ((void*)-1)
+
+static void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+	if (fd < 0 || fd >= 256 || !shm_handles[fd]) return MAP_FAILED;
+
+	DWORD access = FILE_MAP_READ;
+	if (prot & PROT_WRITE) access = FILE_MAP_WRITE;
+
+	return MapViewOfFile(shm_handles[fd], access, 0, offset, length);
+}
+
+static int munmap(void *addr, size_t length) {
+	return UnmapViewOfFile(addr) ? 0 : -1;
+}
+
+static int ftruncate(int fd, off_t length) {
+	// Windows file mapping handles this differently
+	return 0;
+}
+
+#endif
+
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
 #include <stdio.h>
 #include "bwa.h"

@@ -6,16 +6,58 @@
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <stdarg.h>
 #ifndef _WIN32
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <unistd.h>
+#else
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <process.h>
+#include <io.h>
+#define pipe(fds) _pipe(fds, 4096, _O_BINARY)
+#define close _close
+#define dup2 _dup2
+#define STDIN_FILENO 0
+#define STDOUT_FILENO 1
+#define WNOHANG 1
 #endif
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
+#endif
+
+#ifdef _WIN32
+// Windows implementations for POSIX functions that MinGW doesn't provide
+static pid_t waitpid(pid_t pid, int *status, int options) {
+	HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, (DWORD)pid);
+	if (hProcess == NULL) return -1;
+
+	if (options & WNOHANG) {
+		DWORD result = WaitForSingleObject(hProcess, 0);
+		if (result == WAIT_TIMEOUT) {
+			CloseHandle(hProcess);
+			return 0;
+		}
+	} else {
+		WaitForSingleObject(hProcess, INFINITE);
+	}
+
+	DWORD exitCode;
+	GetExitCodeProcess(hProcess, &exitCode);
+	if (status) *status = exitCode;
+	CloseHandle(hProcess);
+	return pid;
+}
+
+// Forward declarations for HTTP/FTP functions
+static int http_open(const char *fn);
+static int ftp_open(const char *fn);
 #endif
 
 #ifdef _WIN32
@@ -229,7 +271,6 @@ ftp_open_end:
 }
 #endif /* !defined(_KO_NO_NET) */
 
-#ifndef _WIN32
 static char **cmd2argv(const char *cmd)
 {
 	int i, beg, end, argc;
@@ -285,6 +326,11 @@ void *kopen(const char *fn, int *_fd)
 		for (p = fn; *p; ++p)
 			if (!isspace(*p)) break;
 		if (*p == '<') { // pipe open
+#ifdef _WIN32
+			// On Windows, disable pipe functionality for now
+			// Could be implemented using CreateProcess with pipe redirection
+			aux = 0; // Failed to open pipe
+#else
 			int need_shell, pfd[2];
 			pid_t pid;
 			// a simple check to see if we need to invoke a shell; not always working
@@ -293,8 +339,8 @@ void *kopen(const char *fn, int *_fd)
 					break;
 			need_shell = (*q != 0);
 			if (pipe(pfd) != 0) return 0;
-			pid = vfork();
-			if (pid == -1) { /* vfork() error */
+			pid = fork(); // Use fork instead of vfork for better compatibility
+			if (pid == -1) { /* fork() error */
 				close(pfd[0]); close(pfd[1]);
 				return 0;
 			}
@@ -316,6 +362,7 @@ void *kopen(const char *fn, int *_fd)
 				aux->fd = pfd[0];
 				aux->pid = pid;
 			}
+#endif
 		} else {
 #ifdef _WIN32
 			*_fd = open(fn, O_RDONLY | O_BINARY);
@@ -337,10 +384,24 @@ int kclose(void *a)
 {
 	koaux_t *aux = (koaux_t*)a;
 	if (aux->type == KO_PIPE) {
+#ifndef _WIN32
 		int status;
 		pid_t pid;
 		pid = waitpid(aux->pid, &status, WNOHANG);
 		if (pid != aux->pid) kill(aux->pid, 15);
+#else
+		// Windows pipe handling would go here
+		int status;
+		pid_t pid;
+		pid = waitpid(aux->pid, &status, WNOHANG);
+		if (pid != aux->pid) {
+			HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, aux->pid);
+			if (hProcess != NULL) {
+				TerminateProcess(hProcess, 1);
+				CloseHandle(hProcess);
+			}
+		}
+#endif
 	}
 	free(aux);
 	return 0;
@@ -372,6 +433,4 @@ int main(int argc, char *argv[])
 	kclose(x);
 	return 0;
 }
-#endif
-
 #endif

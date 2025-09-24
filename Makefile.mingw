@@ -10,7 +10,7 @@ AOBJS=		bwase.o bwaseqio.o bwtgap.o bwtaln.o bamlite.o \
 			bwape.o kopen.o pemerge.o maxk.o \
 			bwtsw2_core.o bwtsw2_main.o bwtsw2_aux.o bwt_lite.o \
 			bwtsw2_chain.o fastmap.o bwtsw2_pair.o \
-			port_math.o port_time.o
+			port_math.o port_time.o port_pthread.o
 PROG=		bwa
 INCLUDES=	
 LIBS=		-lm -lz -lpthread
@@ -94,3 +94,4 @@ rope.o: rle.h rope.h
 utils.o: utils.h ksort.h malloc_wrap.h kseq.h
 port_math.o: port_math.h
 port_time.o: port_time.h
+port_pthread.o: port_pthread.h

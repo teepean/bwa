@@ -1,8 +1,9 @@
 #ifndef PORT_H
 #define PORT_H
 
+#ifdef _WIN32
 #define WINDOWS_PORT
-
+#endif
 
 #ifdef WINDOWS_PORT
 
@@ -18,6 +19,10 @@
 #define __func__ __FUNCTION__
 
 typedef unsigned int u_int32_t;
+
+#ifndef PATH_MAX
+#define PATH_MAX 260
+#endif
 
 #else
 
