@@ -1,6 +1,8 @@
 #include "port_pthread.h"
 
-#ifdef _WIN32
+// Only compile custom pthread implementation for pure Windows (MSVC) builds
+// MinGW/MSYS2/Cygwin already have winpthread
+#if defined(_WIN32) && !defined(__MINGW32__) && !defined(__MINGW64__) && !defined(__CYGWIN__)
 #include <stdlib.h>
 
 struct thread_arg_t {

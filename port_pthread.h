@@ -8,8 +8,9 @@ extern "C"
 #endif
 //--------------------------
 
-#ifdef _WIN32
-// Windows pthread port implementation
+// Check if system already has pthread (MinGW, MSYS2, Cygwin)
+#if defined(_WIN32) && !defined(__MINGW32__) && !defined(__MINGW64__) && !defined(__CYGWIN__)
+// Windows pthread port implementation (only for pure MSVC/Windows builds)
 #include <windows.h>
 
 #define PTHREAD_CREATE_JOINABLE 0
@@ -55,7 +56,7 @@ int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex);
 int pthread_cond_broadcast(pthread_cond_t *cond);
 
 #else
-// Unix systems use standard pthread
+// Unix systems and MinGW/MSYS2/Cygwin use standard pthread
 #include <pthread.h>
 #endif
 

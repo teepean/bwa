@@ -17,7 +17,7 @@ int getrusage(int who, struct rusage * usage)
 {
 	FILETIME ct, et, kt, ut;
 	BOOL r = GetProcessTimes(GetCurrentProcess(), &ct, &et, &kt, &ut);
-	assert(r);
+	if (!r) return -1;
 	usage->ru_stime = FileTime2TimeVal(kt);
 	usage->ru_utime = FileTime2TimeVal(ut);
 	return 0;
