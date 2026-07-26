@@ -401,7 +401,7 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 		use_scheme ? "scheme-fallback" : "prefiltered", tot_prefilt, tot>0?100.0*tot_prefilt/tot:0.0);
 
 	if (do_histo) {   /* per-length-band routing report (budget = %llu) */
-		fprintf(stderr, "[histo] budget=%llu  GPU-kernel %.1fs  CPU-reconcile %.1fs  (reconcile/GPU = %.2fx; <1 means it hides under overlap)\n",
+		fprintf(stderr, "[histo] budget=%llu  GPU-kernel %.3fs  CPU-reconcile %.3fs  (reconcile/GPU = %.2fx; <1 means it hides under overlap)\n",
 			budget, gpu_work_s, recon_s, gpu_work_s>0 ? recon_s/gpu_work_s : 0.0);
 		fprintf(stderr, "[histo] %4s %3s %12s %7s %8s %12s %12s\n", "len","d","reads","hit%","flag%","mean_pops","max_pops");
 		unsigned long long agg_n=0, agg_flag=0;

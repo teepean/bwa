@@ -1070,3 +1070,44 @@ the 20x kernel gain carries through.
 `GPUALN_SCHEME=1` is opt-in. Given ~4.3 M reads of byte-identical validation plus the startup
 covering gate and the automatic K>=5 fallback, promoting it to default is justified; left opt-in
 pending a decision.
+
+## Phase 14 — CompileIQ ptxas tuning: 1.17x on the exact engine, ~1.04x on the scheme engine
+
+`cuda/tune_compileiq.py` drives NVIDIA CompileIQ over the undocumented ptxas Advanced Controls.
+Objective = GPU-kernel seconds (best of N runs, to suppress the thermal drift that plagued every
+measurement this round); **hard correctness gate**: any config whose `.sai` md5 differs from the
+golden value scores INVALID, so a fast-but-wrong schedule can never win. `num_workers=1` so GPU
+timings never contend.
+
+Run:  `/home/teemu/sorsa/CompileIQ/.venv/bin/python cuda/tune_compileiq.py [--scheme] [--reads F]
+       [--golden MD5] [--generations G] [--pool P] [--repeats R]`
+Apply: `nvcc ... -Xptxas=--apply-controls=cuda/gpualn.acf`
+
+### Results (6 generations x pool 20, ~120 configs, ~25 min each)
+| target | baseline | best | tuner | independent interleaved A/B |
+|---|---|---|---|---|
+| `k_dfs_warp2` (exact engine, sub100k) | 1.813 s | 1.509 s | 1.201x | **1.165 / 1.172 / 1.186x** -> ~1.17x |
+| `k_dfs_scheme` (scheme engine, 2730 short) | 1.143 s | 1.100 s | 1.039x | 1.040 / 0.985 / 1.091 / 1.044x -> ~1.04x |
+
+All runs bit-exact (`eecf35c1`, `aa9302bd`).
+
+**The exact-engine gain is real** (tight 1.165-1.186 band, no overlap with baseline).
+**The scheme-engine gain is marginal** -- one of four runs came in below 1.0 and the ranges
+overlap, so ~4% is at the edge of measurability here. Do not quote it as a speedup.
+
+Note the tuner's own figures are slightly optimistic (1.201x vs 1.17x measured) because it scores
+best-of-N; always re-verify a winning ACF with an interleaved A/B.
+
+### Two findings worth keeping
+1. **ACFs do not transfer between kernels.** The ACF tuned for `k_dfs_warp2` gives ~1.17x there
+   but 0.974-1.014x on `k_dfs_scheme`. Tune the engine you intend to SHIP, and use a read set with
+   0% fallback (L<=63) or the objective silently mixes both kernels. `--reads`/`--golden` exist for
+   this.
+2. **The winning schedule REINTRODUCED 40 B of stack frame and +9 registers** (on `k_dfs_scheme`;
+   `k_dfs_warp2` stayed at 0 B / 89 regs). Removing local memory was worth 40% in Phase 6, yet here
+   ptxas trades a little of it back for a better schedule and still wins -- the codegen landscape
+   is not monotone in any single `ptxas -v` metric, which is exactly why an empirical search beats
+   hand-tuning flags.
+
+Caveat for reuse: an ACF is pinned to the ptxas version it was searched against (13.3 here).
+Re-run after a CUDA upgrade rather than assuming it still holds.
