@@ -1165,3 +1165,49 @@ kernel / 51x vs CPU. At 76% mapping it is ~0. Read length only decides the *fall
 Corollary: for high-endogenous samples the lever is the reconcile, not the DFS -- either move
 `bwt_match_gap` for flagged reads onto the GPU, or avoid a full CPU re-alignment per hit. Idea F
 (CPU as an extra aligner) is actively wrong for this regime: the CPU is the bottleneck already.
+
+## Phase 16 — CPU-side: prefetching the next queue entry (+13%, bit-exact, helps plain `bwa aln` too)
+
+Phase 15 showed the CPU reconcile is **98.9%** of the short-read stage for a high-endogenous sample
+(1094 s reconcile vs 25.7 s GPU kernel; samse+IO ~1%). So the CPU path became worth optimising.
+
+Benchmark: 1 M reads from the Atacama short branch (`short.bam` -> fastq; coordinate-sorted, so the
+head is 100% hitting -- ideal for isolating reconcile cost). ~85 s baseline, ~1.5 min per iteration.
+Metric is the `GPUALN_HISTO` `CPU-reconcile` timer; run-to-run noise ~3%.
+
+### What worked: prefetch in `gap_pop` (+13%)
+`bwt_match_gap` is latency-bound on random probes into the 3.14 GB index. The addresses a child
+will need are known when it is created, so they can be prefetched. Two sites, very different value:
+
+| where | distance to use | result |
+|---|---|---|
+| in `gap_push` (child's own buckets) | a few instructions | 84.0 s vs 84-87 s -- **within noise** |
+| in **`gap_pop`** (buckets of the NEXT entry to pop) | a whole node expansion (one `bwt_2occ4` + up to 9 pushes) | **75.6-78.0 s** |
+
+Interleaved A/B, 3 pairs: **1.120x / 1.134x / 1.136x**. All 1 M alignment records byte-identical
+(the only diff is the `@PG CL:` line, which records the binary's own path).
+
+Both prefetch sites are kept -- push-side is free and helps the LIFO same-score case; pop-side is
+where the measurable win is.
+
+`gap_push`/`gap_pop` now take the `bwt_t *` (7 + 1 call sites updated).
+
+### This also speeds up plain CPU `bwa aln`
+The change is in `bwtgap.c`, not the GPU path, so the CPU aligner benefits directly:
+**2730 short set (671,652 reads): 235 s -> 207.7 s = 1.13x**, `.sai` byte-identical.
+
+### What did NOT work
+- **`-march=native -ffp-contract=off`** (Zen 5, 9950X): **92.5 s vs 84-87 s = ~10% SLOWER.**
+  The vectoriser has nothing to work with in a pointer-chasing best-first loop and the code layout
+  gets worse. Reverted. (`-ffp-contract=off` was included deliberately: FMA contraction could change
+  `bwa_cal_maxdiff`'s double arithmetic and therefore `max_diff`, i.e. the output.)
+
+### Validation
+sub2k `4b068014`, sub100k `eecf35c1` (both engines), 2730 CPU `.sai` byte-identical, 1 M SAM records
+byte-identical.
+
+### Still open on the CPU side
+The prefetch distance is bounded by one node expansion, which is short against a ~200-cycle DRAM
+miss. The larger lever is QuadRank-style **batching**: interleave several reads per thread so an
+independent read's probe issues while another waits. That needs `bwt_match_gap` restructured into a
+resumable state machine (N independent `gap_stack_t` round-robined) -- mechanical but invasive.

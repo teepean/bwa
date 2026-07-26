@@ -89,10 +89,18 @@ static void gap_reset_stack(gap_stack_t *stack)
 	stack->n_entries = 0;
 }
 
-static inline void gap_push(gap_stack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape, int n_ins, int n_del,
+/* PREFETCH: a child's next bwt_2occ4 will touch the Occ buckets holding k-1 and l, and those
+ * addresses are already known here. Within a score bin the queue is LIFO, so a child pushed at
+ * the CURRENT best score is popped immediately next -- that is the match-continuation path, the
+ * most common child -- making this a short, well-targeted prefetch distance. The search is
+ * latency-bound on random probes into a 3.14 GB index, so this is the cheapest lever available.
+ * Prefetch never faults, but skip k==0 so we do not touch a wild address for (bwtint_t)-1. */
+static inline void gap_push(const bwt_t *bwt, gap_stack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape, int n_ins, int n_del,
 							int state, int is_diff, const gap_opt_t *opt)
 {
 	int score;
+	if (k) __builtin_prefetch(bwt_occ_intv(bwt, k - 1), 0, 3);
+	__builtin_prefetch(bwt_occ_intv(bwt, l), 0, 3);
 	gap_entry_t *p;
 	gap_stack1_t *q;
 	score = aln_score(n_mm, n_gapo, n_gape, opt);
@@ -112,7 +120,7 @@ static inline void gap_push(gap_stack_t *stack, int i, bwtint_t k, bwtint_t l, i
 	if (stack->best > score) stack->best = score;
 }
 
-static inline void gap_pop(gap_stack_t *stack, gap_entry_t *e)
+static inline void gap_pop(const bwt_t *bwt, gap_stack_t *stack, gap_entry_t *e)
 {
 	gap_stack1_t *q;
 	q = stack->stacks + stack->best;
@@ -125,6 +133,17 @@ static inline void gap_pop(gap_stack_t *stack, gap_entry_t *e)
 			if (stack->stacks[i].n_entries != 0) break;
 		stack->best = i;
 	} else if (stack->n_entries == 0) stack->best = stack->n_stacks;
+	/* PREFETCH the entry that the NEXT gap_pop will take. This is a longer and better-targeted
+	 * distance than prefetching at push time: a whole node expansion (one bwt_2occ4 plus up to
+	 * nine pushes) separates this from the use. */
+	if (stack->n_entries) {
+		const gap_stack1_t *nq = stack->stacks + stack->best;
+		if (nq->n_entries) {
+			const gap_entry_t *n = nq->stack + (nq->n_entries - 1);
+			if (n->k) __builtin_prefetch(bwt_occ_intv(bwt, n->k - 1), 0, 3);
+			__builtin_prefetch(bwt_occ_intv(bwt, n->l), 0, 3);
+		}
+	}
 }
 
 static inline void gap_shadow(int x, int len, bwtint_t max, int last_diff_pos, bwt_width_t *w)
@@ -178,7 +197,7 @@ bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_wid
 
 	//for (j = 0; j != len; ++j) printf("#0 %d: [%d,%u]\t[%d,%u]\n", j, w[0][j].bid, w[0][j].w, w[1][j].bid, w[1][j].w);
 	gap_reset_stack(stack); // reset stack
-	gap_push(stack, len, 0, bwt->seq_len, 0, 0, 0, 0, 0, 0, 0, opt);
+	gap_push(bwt, stack, len, 0, bwt->seq_len, 0, 0, 0, 0, 0, 0, 0, opt);
 
 	while (stack->n_entries) {
 		gap_entry_t e;
@@ -192,7 +211,7 @@ bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_wid
 #else
 		if (stack->n_entries > opt->max_entries) break;
 #endif
-		gap_pop(stack, &e); // get the best entry
+		gap_pop(bwt, stack, &e); // get the best entry
 		k = e.k; l = e.l; // SA interval
 		i = e.info&0xffff; // length
 		if (!(opt->mode & BWA_MODE_NONSTOP) && e.info>>21 > best_score + opt->s_mm) break; // no need to proceed
@@ -273,24 +292,24 @@ bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_wid
 			if (e.state == STATE_M) { // gap open
 				if (e.n_gapo < opt->max_gapo) { // gap open is allowed
 					// insertion
-					gap_push(stack, i, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
+					gap_push(bwt, stack, i, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
 					// deletion
 					for (j = 0; j != 4; ++j) {
 						k = bwt->L2[j] + cnt_k[j] + 1;
 						l = bwt->L2[j] + cnt_l[j];
-						if (k <= l) gap_push(stack, i + 1, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+						if (k <= l) gap_push(bwt, stack, i + 1, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
 					}
 				}
 			} else if (e.state == STATE_I) { // extention of an insertion
 				if (e.n_gape < opt->max_gape) // gap extention is allowed
-					gap_push(stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
+					gap_push(bwt, stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
 			} else if (e.state == STATE_D) { // extention of a deletion
 				if (e.n_gape < opt->max_gape) { // gap extention is allowed
 					if (e.n_gape + e.n_gapo < max_diff || occ < opt->max_del_occ) {
 						for (j = 0; j != 4; ++j) {
 							k = bwt->L2[j] + cnt_k[j] + 1;
 							l = bwt->L2[j] + cnt_l[j];
-							if (k <= l) gap_push(stack, i + 1, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+							if (k <= l) gap_push(bwt, stack, i + 1, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
 						}
 					}
 				}
@@ -303,13 +322,13 @@ bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_wid
 				int is_mm = (j != 4 || seq[i] > 3);
 				k = bwt->L2[c] + cnt_k[c] + 1;
 				l = bwt->L2[c] + cnt_l[c];
-				if (k <= l) gap_push(stack, i, k, l, e.n_mm + is_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, is_mm, opt);
+				if (k <= l) gap_push(bwt, stack, i, k, l, e.n_mm + is_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, is_mm, opt);
 			}
 		} else if (seq[i] < 4) { // try exact match only
 			int c = seq[i] & 3;
 			k = bwt->L2[c] + cnt_k[c] + 1;
 			l = bwt->L2[c] + cnt_l[c];
-			if (k <= l) gap_push(stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, 0, opt);
+			if (k <= l) gap_push(bwt, stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, 0, opt);
 		}
 	}
 
