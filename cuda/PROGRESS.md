@@ -1111,3 +1111,57 @@ best-of-N; always re-verify a winning ACF with an interleaved A/B.
 
 Caveat for reuse: an ACF is pinned to the ptxas version it was searched against (13.3 here).
 Re-run after a CUDA upgrade rather than assuming it still holds.
+
+## Phase 15 — real-world end-to-end run (SRR4090088, Atacama, paired 101 bp)
+
+Full `adna_aligner.sh` run, GPU short branch + mem3 long branch + sambamba markdup:
+```
+cd /home/dnastorage/aDNApipeline
+BWA_GPU=/home/teemu/sorsa/backtrackcuda/bwa-gpu GPUALN_SCHEME=1 ./adna_aligner.sh \
+  -1 .../SRR4090088_1.fastq.gz -2 .../SRR4090088_2.fastq.gz \
+  -i SRR4090088 -p atacama -t 16 -a mem3 -d -g
+```
+**`BWA_GPU` must be set explicitly**: a stale `bwa-gpu` (1 June, pre-scheme-engine) sits on PATH at
+`~/.local/bin/bwa-gpu`, and the script's default is the bare name, so the run would otherwise have
+silently used the old engine. Also note `REF="hs37d5.fa"` is RELATIVE -- run from the directory
+holding the indexes.
+
+### Result: 58 min wall, 214,206,193 records in the final BAM
+| stage | time |
+|---|---|
+| AdapterRemoval3 (476 M reads) | ~3 min |
+| split at 64 bp | ~6 min |
+| **GPU short reads (12.0 M)** | **19 min** |
+| mem3 long reads (202.2 M) | ~28 min |
+| merge + index + markdup | ~2 min |
+
+| branch | records | mapped |
+|---|---|---|
+| short (<64 bp, GPU) | 11,999,627 | 9,108,005 (**75.9%**) |
+| long (>=64 bp, mem3) | 202,206,566 | 198,769,271 (98.3%) |
+
+Final: 208,037,248 primary + 6,168,945 supplementary, 13,799,975 duplicates (6.6%).
+
+### The superset contract, confirmed on real data
+GPU flagged **9,167,292** reads as possible hits; the exact CPU reconcile confirmed **9,108,005**.
+The 59,287 difference (0.49% of reads, 0.65% of flags) is exactly the designed false-positive
+margin of a superset filter -- all resolved correctly by `bwt_match_gap` on the CPU.
+**`scheme-fallback 0 (0.00%)`**: every short read had max_diff 3 or 4, so the Renders/SeqAn3
+tables covered 100% of them and the exact-engine fallback was never taken, as predicted for L<=63.
+
+### The important negative: the scheme engine bought ~nothing HERE
+The short stage ran at 10,495 reads/s with `bwa-gpu` at ~1,466% CPU -- **CPU-bound, not
+GPU-bound**, because **76.4% of the short reads MAP** and every hit is re-aligned by
+`bwt_match_gap` on the CPU. The pipeline overlaps the GPU kernel with the CPU finisher, so with
+~1,143 s of reconcile the kernel (~400 s old engine, ~20 s scheme engine) hides completely under
+it either way.
+
+**Rule: the benefit scales with the fraction of reads that DO NOT map, not with read length.**
+This engine accelerates *proving a read unmappable*. At the 0.5% mapping rate of the aDNA
+libraries it was built for (AVA1B, 2730) that is 99.5% of the work and the measured gain is 20x
+kernel / 51x vs CPU. At 76% mapping it is ~0. Read length only decides the *fallback* rate
+(0% here, as designed); mapping rate decides the *speedup*.
+
+Corollary: for high-endogenous samples the lever is the reconcile, not the DFS -- either move
+`bwt_match_gap` for flagged reads onto the GPU, or avoid a full CPU re-alignment per hit. Idea F
+(CPU as an extra aligner) is actively wrong for this regime: the CPU is the bottleneck already.
