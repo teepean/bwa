@@ -434,12 +434,31 @@ __device__ int d_dfs_has_hit_warp2(const fmidx_dev fm, const uint8_t *seq, int l
 	}
 }
 
+/* Pigeonhole prefilter: see dfs_engine.cuh for the full correctness argument. */
+__device__ __forceinline__ int d_pigeonhole_prefilter(const fmidx_dev fm, const uint8_t *seq,
+                                                      int len, int max_diff)
+{
+	const unsigned FULL = 0xffffffffu;
+	int lane = threadIdx.x & 31;
+	int nseg = max_diff + 1;
+	int seg_len = len / nseg;
+	if (seg_len < 1) return 1;
+	int seg_match = 0;
+	if (lane < nseg) {
+		int seg_start = lane * seg_len;
+		int slen = (lane == nseg - 1) ? (len - seg_start) : seg_len;
+		uint64_t kk = 0, ll = fm.seq_len;
+		seg_match = d_bwt_match_exact_alt(fm, seq + seg_start, slen, &kk, &ll);
+	}
+	return __any_sync(FULL, seg_match) ? 1 : 0;
+}
+
 __global__ void k_dfs_warp2(fmidx_dev fm, const uint8_t *seq, const uint64_t *w_w, const int *w_bid,
                             const ReadParam *rp, int nreads, int max_gapo, int max_gape, int mode,
                             int indel_end_skip, int max_del_occ, int CAP_SM, int CAP_GL,
                             uint64_t *Gk, uint64_t *Gl, uint32_t *Gn, uint8_t *has_hit,
                             int *workctr, unsigned long long *npop, unsigned long long budget,
-                            int *nflag, int wpb)
+                            int *nflag, int wpb, int use_prefilter, int *nprefilt)
 {
 	extern __shared__ unsigned char smem[];
 	int warp_in_block = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -456,6 +475,10 @@ __global__ void k_dfs_warp2(fmidx_dev fm, const uint8_t *seq, const uint64_t *w_
 		r = __shfl_sync(0xffffffffu, r, 0);
 		if (r >= nreads) break;
 		ReadParam p = rp[r];
+		if (use_prefilter && !d_pigeonhole_prefilter(fm, seq + p.seq_off, p.len, p.max_diff)) {
+			if (lane == 0) { has_hit[r] = 0; npop[r] = 0; atomicAdd(nprefilt, 1); }
+			continue;
+		}
 		int flagged = 0; unsigned long long nn = 0;
 		int hh = d_dfs_has_hit_warp2(fm, seq + p.seq_off, p.len, w_w + p.w_off, w_bid + p.w_off,
 			p.max_diff, max_gapo, max_gape, mode, indel_end_skip, max_del_occ, sk, sl, sn, CAP_SM,
@@ -653,22 +676,29 @@ int main(int argc, char **argv)
 		int wpb = getenv("DFS_WARP_WPB") ? atoi(getenv("DFS_WARP_WPB")) : 4;
 		int CAP_SM = getenv("DFS_WARP_CAP") ? atoi(getenv("DFS_WARP_CAP")) : 512;
 		int CAP_GL = getenv("DFS_WARP_GCAP") ? atoi(getenv("DFS_WARP_GCAP")) : 16384;
+		int use_prefilter = getenv("DFS_NOPREFILTER") ? 0 : 1;
 		int bdim = wpb * 32;
 		size_t shbytes = (size_t)wpb * CAP_SM * (8 + 8 + 4);
 		CK(cudaFuncSetAttribute(k_dfs_warp2, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shbytes));
 		int mb = 0; CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mb, k_dfs_warp2, bdim, shbytes));
 		int nb = mb > 0 ? mb * numSM : numSM;
 		size_t nwarps = (size_t)nb * wpb;
-		uint64_t *Gk, *Gl; uint32_t *Gn;
+		uint64_t *Gk, *Gl; uint32_t *Gn; int *d_nprefilt;
 		CK(cudaMalloc(&Gk, nwarps * CAP_GL * 8));
 		CK(cudaMalloc(&Gl, nwarps * CAP_GL * 8));
 		CK(cudaMalloc(&Gn, nwarps * CAP_GL * 4));
+		CK(cudaMalloc(&d_nprefilt, 4)); CK(cudaMemset(d_nprefilt, 0, 4));
 		fprintf(stderr, "[gpu] WARP2: %d w/blk CAP_SM=%d shared=%.1fKB/blk -> %d blk/SM (%d w/SM, %zu reads in flight); "
-			"global backing %d/warp -> %.0f MB\n", wpb, CAP_SM, shbytes/1024.0, mb, mb*wpb, nwarps,
-			CAP_GL, nwarps*CAP_GL*20.0/1e6);
+			"global backing %d/warp -> %.0f MB; prefilter=%s\n", wpb, CAP_SM, shbytes/1024.0, mb, mb*wpb, nwarps,
+			CAP_GL, nwarps*CAP_GL*20.0/1e6, use_prefilter?"ON":"OFF");
 		k_dfs_warp2<<<nb, bdim, shbytes>>>(fm, d_seq, d_ww, d_wbid, d_rp, n_seqs,
 			local_opt.max_gapo, local_opt.max_gape, local_opt.mode, local_opt.indel_end_skip,
-			local_opt.max_del_occ, CAP_SM, CAP_GL, Gk, Gl, Gn, d_hit, d_wc, d_npop, budget, d_nflag, wpb);
+			local_opt.max_del_occ, CAP_SM, CAP_GL, Gk, Gl, Gn, d_hit, d_wc, d_npop, budget, d_nflag, wpb,
+			use_prefilter, d_nprefilt);
+		CK(cudaDeviceSynchronize());
+		{ int npf=0; CK(cudaMemcpy(&npf, d_nprefilt, 4, cudaMemcpyDeviceToHost));
+		  fprintf(stderr, "[gpu] pigeonhole-prefiltered: %d / %d (%.2f%%)\n", npf, n_seqs, 100.0*npf/n_seqs); }
+		CK(cudaFree(Gk)); CK(cudaFree(Gl)); CK(cudaFree(Gn)); CK(cudaFree(d_nprefilt));
 	} else {
 		int blockDim = 128, cap = 512; /* DFS depth max ~386; overflow -> CPU reconcile (safe) */
 		int maxBlocks = 0;

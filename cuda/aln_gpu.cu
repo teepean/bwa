@@ -38,6 +38,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <unistd.h>
+#include <algorithm>
 #include <cuda_runtime.h>
 
 extern "C" {
@@ -58,6 +59,7 @@ extern char *bwa_pg;   /* @PG line printed by bwa_print_sam_hdr if set */
 #define FM_DEVICE_DEFINE_CONST
 #include "fm_device.cuh"
 #include "dfs_engine.cuh"
+#include "scheme_engine.cuh"
 
 #define CK(call) do { cudaError_t e_ = (call); if (e_ != cudaSuccess) { \
 	fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(1); } } while (0)
@@ -70,7 +72,24 @@ struct Chunk {
 	std::vector<ReadParam> rp;
 	std::vector<uint8_t> seq_flat; std::vector<uint64_t> w_flat; std::vector<int> bid_flat;
 	std::vector<uint8_t> has_hit;
+	std::vector<int> order;                 /* longest-first work-pool permutation */
+	std::vector<unsigned long long> npop;   /* GPUALN_HISTO only */
+	std::vector<uint8_t> flag;              /* GPUALN_HISTO only */
 	gap_opt_t base; int stack_maxdiff, max_len;
+	int seq_id;
+};
+
+/* per-GPU context: own BWT copy, backing, device buffers, occupancy */
+struct GpuCtx {
+	int dev;
+	fmidx_dev fm;
+	int nblocks, bdim, wpb, CAP_SM, CAP_GL;
+	size_t shbytes;
+	uint64_t *Gk, *Gl; uint32_t *Gn;
+	uint8_t *d_seq; uint64_t *d_ww; int *d_wbid; ReadParam *d_rp;
+	uint8_t *d_hit; unsigned long long *d_npop; int *d_wc, *d_nflag, *d_nprefilt;
+	uint8_t *d_flag; int *d_order;
+	size_t cap_seq, cap_w, cap_n;
 };
 
 /* C-callable entry: usable as a bwa subcommand (`bwa gpualn ...`) or standalone (ALN_GPU_MAIN).
@@ -95,32 +114,63 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 	const char *prefix = argv[optind], *fq = argv[optind+1];
 	if (getenv("DFS_WARP_CAP")) CAP_SM = atoi(getenv("DFS_WARP_CAP"));
 	if (getenv("DFS_WARP_GCAP")) CAP_GL = atoi(getenv("DFS_WARP_GCAP"));
+	if (getenv("DFS_WARP_WPB")) wpb = atoi(getenv("DFS_WARP_WPB"));   /* warps per block (occupancy sweep) */
+	/* The two-level stack spills in CHUNK=128 blocks and assumes a full chunk plus a wave's worth
+	 * of headroom fits in the shared window; below that the spill silently corrupts the frontier
+	 * (CAP_SM=128 produced a WRONG .sai). Enforce it rather than trusting the caller. */
+	if (CAP_SM < 256) { fprintf(stderr, "[aln-gpu] CAP_SM=%d too small (must be >= 256)\n", CAP_SM); return 1; }
+	if (CAP_GL < 256 || (CAP_GL % 128)) { fprintf(stderr, "[aln-gpu] CAP_GL=%d invalid (>=256, multiple of 128)\n", CAP_GL); return 1; }
 	unsigned long long budget = getenv("DFS_BUDGET") ? strtoull(getenv("DFS_BUDGET"),NULL,10) : 2000000ULL;
+	int use_prefilter = getenv("DFS_NOPREFILTER") ? 0 : 1;
 	int nT = opt->n_threads > 0 ? opt->n_threads : 1;
-	int do_histo = getenv("GPUALN_HISTO") != NULL;   /* opt-in per-length-band node-pop/flag histogram */
+	int do_histo = getenv("GPUALN_HISTO") != NULL;
+	int use_order = getenv("GPUALN_NOORDER") ? 0 : 1;
+	int use_scheme = getenv("GPUALN_SCHEME") ? 1 : 0;   /* bidirectional search-scheme engine */   /* longest-first scheduling (A/B knob) */   /* opt-in per-length-band node-pop/flag histogram */
 
 	char bwt_fn[4096]; snprintf(bwt_fn, sizeof bwt_fn, "%s.bwt", prefix);
 	fprintf(stderr, "[aln-gpu] loading %s\n", bwt_fn);
 	bwt_t *bwt = bwt_restore_bwt(bwt_fn);
 	if (!bwt) { fprintf(stderr, "failed to load bwt\n"); return 1; }
 
-	uint32_t *d_bwt = NULL;
-	CK(cudaMalloc(&d_bwt, bwt->bwt_size * sizeof(uint32_t)));
-	CK(cudaMemcpy(d_bwt, bwt->bwt, bwt->bwt_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
-	CK(cudaMemcpyToSymbol(c_cnt_table, bwt->cnt_table, sizeof(uint32_t)*256));
-	CK(cudaMemcpyToSymbol(c_L2, bwt->L2, sizeof(uint64_t)*5));
-	fmidx_dev fm{ d_bwt, bwt->primary, bwt->seq_len };
-
-	/* occupancy + one-time global backing allocation */
-	int numSM = 0; CK(cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, 0));
-	int bdim = wpb * 32; size_t shbytes = (size_t)wpb * CAP_SM * 20;
-	CK(cudaFuncSetAttribute(k_dfs_warp2, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shbytes));
-	int mb = 0; CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mb, k_dfs_warp2, bdim, shbytes));
-	int nblocks = mb > 0 ? mb * numSM : numSM; size_t nwarps = (size_t)nblocks * wpb;
-	uint64_t *Gk, *Gl; uint32_t *Gn;
-	CK(cudaMalloc(&Gk, nwarps*CAP_GL*8)); CK(cudaMalloc(&Gl, nwarps*CAP_GL*8)); CK(cudaMalloc(&Gn, nwarps*CAP_GL*4));
-	fprintf(stderr, "[aln-gpu] %d blk/SM x %d warps, CAP_SM=%d CAP_GL=%d, backing %.0f MB; %d CPU threads\n",
-		mb, wpb, CAP_SM, CAP_GL, nwarps*CAP_GL*20.0/1e6, nT);
+	/* multi-GPU init: detect devices, upload BWT + allocate backing on each */
+	int nGpu = 0; CK(cudaGetDeviceCount(&nGpu));
+	if (getenv("GPUALN_NGPU")) nGpu = atoi(getenv("GPUALN_NGPU"));
+	if (nGpu < 1) nGpu = 1;
+	std::vector<GpuCtx> gpus(nGpu);
+	for (int g = 0; g < nGpu; g++) {
+		CK(cudaSetDevice(g));
+		GpuCtx &gx = gpus[g];
+		gx.dev = g; gx.wpb = wpb; gx.CAP_SM = CAP_SM; gx.CAP_GL = CAP_GL;
+		uint32_t *db = NULL;
+		CK(cudaMalloc(&db, bwt->bwt_size * sizeof(uint32_t)));
+		CK(cudaMemcpy(db, bwt->bwt, bwt->bwt_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
+		CK(cudaMemcpyToSymbol(c_cnt_table, bwt->cnt_table, sizeof(uint32_t)*256));
+		CK(cudaMemcpyToSymbol(c_L2, bwt->L2, sizeof(uint64_t)*5));
+		gx.fm = fmidx_dev{ db, bwt->primary, bwt->seq_len };
+		int numSM = 0; CK(cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, g));
+		gx.bdim = wpb * 32;
+		gx.shbytes = (size_t)wpb * CAP_SM * (use_scheme ? sizeof(SNode) : 20);
+		int mb = 0;
+		if (use_scheme) {
+			if (sch_upload(g == 0)) { fprintf(stderr, "[scheme] table validation FAILED\n"); return 1; }
+			CK(cudaFuncSetAttribute(k_dfs_scheme, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gx.shbytes));
+			CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mb, k_dfs_scheme, gx.bdim, gx.shbytes));
+		} else {
+			CK(cudaFuncSetAttribute(k_dfs_warp2, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gx.shbytes));
+			CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mb, k_dfs_warp2, gx.bdim, gx.shbytes));
+		}
+		gx.nblocks = mb > 0 ? mb * numSM : numSM;
+		size_t nwarps = (size_t)gx.nblocks * wpb;
+		CK(cudaMalloc(&gx.Gk, nwarps*CAP_GL*8)); CK(cudaMalloc(&gx.Gl, nwarps*CAP_GL*8)); CK(cudaMalloc(&gx.Gn, nwarps*CAP_GL*4));
+		gx.d_seq=NULL; gx.d_ww=NULL; gx.d_wbid=NULL; gx.d_rp=NULL;
+		gx.d_hit=NULL; gx.d_npop=NULL; gx.d_wc=NULL; gx.d_nflag=NULL; gx.d_nprefilt=NULL; gx.d_flag=NULL; gx.d_order=NULL;
+		gx.cap_seq=0; gx.cap_w=0; gx.cap_n=0;
+		char name[256]; cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, g));
+		snprintf(name, sizeof name, "%s", prop.name);
+		fprintf(stderr, "[aln-gpu] GPU %d (%s): %d SM, %d blk/SM x %d warps, backing %.0f MB\n",
+			g, name, numSM, mb, mb*wpb, nwarps*CAP_GL*20.0/1e6);
+	}
+	fprintf(stderr, "[aln-gpu] %d GPU(s), CAP_SM=%d CAP_GL=%d; %d CPU threads\n", nGpu, CAP_SM, CAP_GL, nT);
 
 	/* output: .sai (default) or fused alnse SAM (-S) */
 	FILE *out = NULL; bntseq_t *bns = NULL; ubyte_t *pacseq = NULL;
@@ -148,41 +198,102 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 
 	bwa_seqio_t *ks = bwa_seq_open(fq);
 
-	/* reusable device buffers, grown on demand */
-	uint8_t *d_seq=NULL; uint64_t *d_ww=NULL; int *d_wbid=NULL; ReadParam *d_rp=NULL;
-	uint8_t *d_hit=NULL; unsigned long long *d_npop=NULL; int *d_wc=NULL, *d_nflag=NULL;
-	uint8_t *d_flag=NULL;                       /* per-read flag bit (histo mode only) */
-	size_t cap_seq=0, cap_w=0, cap_n=0;
+	long long tot=0, tot_flag=0, tot_prefilt=0; double t0=now_s();
 
-	long long tot=0, tot_flag=0; double t0=now_s();
-
-	/* opt-in instrumentation (GPUALN_HISTO=1): per-read-length stats to decide GPU/CPU routing.
-	 * gpu_work_s = wall in the kernel section; recon_s = wall in the CPU bwt_match_gap reconcile.
-	 * The routing question is whether a band's flag rate (and thus recon load) stays small. */
+	/* opt-in instrumentation (GPUALN_HISTO=1) */
 	const int MAXL = 256;
 	std::vector<unsigned long long> H_n(MAXL,0), H_hit(MAXL,0), H_flag(MAXL,0), H_sum(MAXL,0), H_max(MAXL,0);
 	std::vector<int> H_d(MAXL,-1);
-	std::vector<unsigned long long> h_npop; std::vector<uint8_t> h_flag;   /* host scratch */
 	double gpu_work_s = 0, recon_s = 0;
 
-	/* ---- CPU/GPU overlap (#5): the main thread owns the GPU (read -> preprocess -> upload ->
-	 * kernel -> download has_hit, serial on one stream so the shared global backing is never
-	 * raced). Each finished chunk is handed to ONE in-order finisher thread that does the CPU
-	 * reconcile + output, running concurrently with the next chunk's GPU work. Single ordered
-	 * consumer => drand48/output order preserved => bit-exact. (For multi-GPU later: replicate the
-	 * GPU producer stage per device and round-robin chunks; the finisher stays a single ordered
-	 * consumer to keep output/RNG order.) ---- */
-	std::mutex qmu; std::condition_variable q_ready, q_free; std::queue<Chunk*> Q; bool done=false;
-	const size_t QCAP = 2;
-	auto finisher = [&](){
+	/* ---- Multi-GPU pipeline (3 stages):
+	 * Stage 1 (main thread): read FASTQ + MT preprocess -> push Chunk* to "ready" queue.
+	 * Stage 2 (N GPU workers): pop from ready -> upload -> kernel -> download has_hit -> mark done.
+	 * Stage 3 (finisher): process completed chunks IN ORDER -> reconcile + output.
+	 * Ordering: chunks have seq_id; finisher waits for next-in-order via completion buffer.
+	 * Bit-exactness: single ordered finisher preserves drand48/output order. ---- */
+	std::mutex rmu; std::condition_variable r_ready, r_free;
+	std::queue<Chunk*> RQ; bool read_done = false;
+	const size_t RQCAP = (size_t)(nGpu + 2);
+
+	std::mutex cmu; std::condition_variable c_done_cv;
+	std::vector<Chunk*> cslots; int next_out = 0; bool all_done = false;
+
+	auto gpu_worker = [&](int gid){
+		GpuCtx &gx = gpus[gid];
+		CK(cudaSetDevice(gx.dev));
 		for (;;) {
 			Chunk *c;
-			{ std::unique_lock<std::mutex> lk(qmu); q_ready.wait(lk, [&]{ return !Q.empty() || done; });
-			  if (Q.empty()) break; c = Q.front(); Q.pop(); }
-			q_free.notify_one();
+			{ std::unique_lock<std::mutex> lk(rmu);
+			  r_ready.wait(lk, [&]{ return !RQ.empty() || read_done; });
+			  if (RQ.empty()) break;
+			  c = RQ.front(); RQ.pop(); }
+			r_free.notify_one();
+			int nseq = c->n_seqs;
+			size_t so = c->seq_flat.size(), wo = c->w_flat.size();
+			if (so > gx.cap_seq){ if(gx.d_seq)cudaFree(gx.d_seq); CK(cudaMalloc(&gx.d_seq, so)); gx.cap_seq=so; }
+			if (wo > gx.cap_w){ if(gx.d_ww)cudaFree(gx.d_ww); if(gx.d_wbid)cudaFree(gx.d_wbid);
+				CK(cudaMalloc(&gx.d_ww, wo*8)); CK(cudaMalloc(&gx.d_wbid, wo*4)); gx.cap_w=wo; }
+			if ((size_t)nseq > gx.cap_n){ if(gx.d_rp)cudaFree(gx.d_rp); if(gx.d_hit)cudaFree(gx.d_hit);
+				if(gx.d_npop)cudaFree(gx.d_npop); if(gx.d_flag)cudaFree(gx.d_flag);
+				CK(cudaMalloc(&gx.d_rp, nseq*sizeof(ReadParam))); CK(cudaMalloc(&gx.d_hit, nseq));
+				CK(cudaMalloc(&gx.d_npop, nseq*8)); CK(cudaMalloc(&gx.d_flag, nseq));
+				if (gx.d_order) cudaFree(gx.d_order); CK(cudaMalloc(&gx.d_order, nseq*4)); gx.cap_n=nseq; }
+			if (!gx.d_wc){ CK(cudaMalloc(&gx.d_wc,4)); CK(cudaMalloc(&gx.d_nflag,4)); CK(cudaMalloc(&gx.d_nprefilt,4)); }
+			CK(cudaMemcpy(gx.d_seq, c->seq_flat.data(), so, cudaMemcpyHostToDevice));
+			CK(cudaMemcpy(gx.d_ww, c->w_flat.data(), wo*8, cudaMemcpyHostToDevice));
+			CK(cudaMemcpy(gx.d_wbid, c->bid_flat.data(), wo*4, cudaMemcpyHostToDevice));
+			CK(cudaMemcpy(gx.d_rp, c->rp.data(), nseq*sizeof(ReadParam), cudaMemcpyHostToDevice));
+			CK(cudaMemcpy(gx.d_order, c->order.data(), nseq*4, cudaMemcpyHostToDevice));
+			CK(cudaMemset(gx.d_wc,0,4)); CK(cudaMemset(gx.d_nflag,0,4)); CK(cudaMemset(gx.d_nprefilt,0,4));
+			double _gk0 = now_s();
+			if (use_scheme)
+				k_dfs_scheme<<<gx.nblocks, gx.bdim, gx.shbytes>>>(gx.fm, gx.d_seq, gx.d_ww, gx.d_wbid, gx.d_rp, nseq,
+					c->base.max_gapo, c->base.max_gape, c->base.mode, c->base.indel_end_skip, c->base.max_del_occ,
+					gx.CAP_SM, gx.CAP_GL, gx.Gk, gx.Gl, gx.Gn, gx.d_hit, gx.d_wc, gx.d_npop, budget, gx.d_nflag,
+					gx.wpb, gx.d_flag, use_order ? gx.d_order : NULL, gx.d_nprefilt);
+			else
+				k_dfs_warp2<<<gx.nblocks, gx.bdim, gx.shbytes>>>(gx.fm, gx.d_seq, gx.d_ww, gx.d_wbid, gx.d_rp, nseq,
+					c->base.max_gapo, c->base.max_gape, c->base.mode, c->base.indel_end_skip, c->base.max_del_occ,
+					gx.CAP_SM, gx.CAP_GL, gx.Gk, gx.Gl, gx.Gn, gx.d_hit, gx.d_wc, gx.d_npop, budget, gx.d_nflag,
+					gx.wpb, gx.d_flag, use_prefilter, gx.d_nprefilt, use_order ? gx.d_order : NULL);
+			CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
+			if (do_histo) { std::lock_guard<std::mutex> lk(cmu); gpu_work_s += now_s() - _gk0; }
+			int hpf=0; CK(cudaMemcpy(&hpf, gx.d_nprefilt, 4, cudaMemcpyDeviceToHost));
+			CK(cudaMemcpy(c->has_hit.data(), gx.d_hit, nseq, cudaMemcpyDeviceToHost));
+			if (do_histo) {   /* node-pop / flag detail for the per-length-band report */
+				c->npop.resize(nseq); c->flag.resize(nseq);
+				CK(cudaMemcpy(c->npop.data(), gx.d_npop, (size_t)nseq*8, cudaMemcpyDeviceToHost));
+				CK(cudaMemcpy(c->flag.data(), gx.d_flag, nseq, cudaMemcpyDeviceToHost));
+			}
+			{ std::lock_guard<std::mutex> lk(cmu);
+			  tot_prefilt += hpf;
+			  cslots[c->seq_id] = c;
+			  c_done_cv.notify_one(); }
+		}
+	};
+
+	auto finisher = [&](){
+		for (;;) {
+			Chunk *c = NULL;
+			{ std::unique_lock<std::mutex> lk(cmu);
+			  c_done_cv.wait(lk, [&]{ return (next_out < (int)cslots.size() && cslots[next_out]) || all_done; });
+			  if (next_out >= (int)cslots.size() && all_done) break;
+			  if (!cslots[next_out]) continue;
+			  c = cslots[next_out]; cslots[next_out] = NULL; next_out++; }
 			int nseq = c->n_seqs;
 			std::vector<int> idx; for (int i=0;i<nseq;i++) if (c->has_hit[i]) idx.push_back(i);
 			tot_flag += idx.size();
+			if (do_histo && !c->npop.empty()) {   /* accumulate the per-length-band routing histogram */
+				for (int i=0;i<nseq;i++) {
+					int L = c->rp[i].len; if (L < 0 || L >= MAXL) continue;
+					H_n[L]++; H_d[L] = c->rp[i].max_diff;
+					if (c->has_hit[i]) H_hit[L]++;
+					if (c->flag[i]) H_flag[L]++;
+					H_sum[L] += c->npop[i];
+					if (c->npop[i] > H_max[L]) H_max[L] = c->npop[i];
+				}
+			}
 			std::vector<int> n_aln(nseq,0); std::vector<bwt_aln1_t*> aln(nseq,NULL);
 			std::vector<std::thread> ths;
 			double _rc0 = now_s();
@@ -199,7 +310,7 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 				gap_destroy_stack(st);
 			});
 			for (auto&th:ths) th.join();
-			if (do_histo) recon_s += now_s() - _rc0;   /* single consumer thread -> race-free */
+			if (do_histo) recon_s += now_s() - _rc0;
 			if (!sam_mode) {
 				for (int i=0;i<nseq;i++){ err_fwrite(&n_aln[i],4,1,out); if (n_aln[i]) err_fwrite(aln[i],sizeof(bwt_aln1_t),n_aln[i],out); free(aln[i]); }
 			} else {
@@ -224,12 +335,31 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 			fprintf(stderr, "\r[aln-gpu] %lld reads done (%.0f reads/s)   ", tot, tot/(now_s()-t0));
 		}
 	};
+
+	std::vector<std::thread> workers;
+#ifdef DFS_INSTRUMENT
+	/* Idea-A cost probe: DFS_STAIR=p:u1:u2 emulates ONE search of a p-part staircase scheme.
+	 * Output is MEANINGLESS with this set -- it measures that search's tree size only. */
+	if (getenv("DFS_STAIR")) {
+		int sp_=3, su1=1, su2=2, on=1;
+		sscanf(getenv("DFS_STAIR"), "%d:%d:%d", &sp_, &su1, &su2);
+		for (int g=0; g<nGpu; g++) {
+			CK(cudaSetDevice(gpus[g].dev));
+			CK(cudaMemcpyToSymbol(g_stair_on, &on, 4));
+			CK(cudaMemcpyToSymbol(g_stair_p, &sp_, 4));
+			CK(cudaMemcpyToSymbol(g_stair_u1, &su1, 4));
+			CK(cudaMemcpyToSymbol(g_stair_u2, &su2, 4));
+		}
+		fprintf(stderr, "[stair] p=%d U=(%d,%d,max_diff)  *** .sai is INVALID; cost measurement only ***\n", sp_, su1, su2);
+	}
+#endif
+	for (int g=0;g<nGpu;g++) workers.emplace_back(gpu_worker, g);
 	std::thread cons(finisher);
 
-	int n_seqs; bwa_seq_t *seqs;
+	int n_seqs; bwa_seq_t *seqs; int seq_id = 0;
 	while ((seqs = bwa_read_seq(ks, 0x40000, &n_seqs, opt->mode, opt->trim_qual)) != 0) {
 		Chunk *c = new Chunk();
-		c->seqs = seqs; c->n_seqs = n_seqs; c->base = *opt; c->max_len = 0;
+		c->seqs = seqs; c->n_seqs = n_seqs; c->base = *opt; c->max_len = 0; c->seq_id = seq_id++;
 		for (int i=0;i<n_seqs;i++) if (seqs[i].len > c->max_len) c->max_len = seqs[i].len;
 		if (opt->fnr > 0.0) c->base.max_diff = bwa_cal_maxdiff(c->max_len, BWA_AVG_ERR, opt->fnr);
 		if (c->base.max_diff < c->base.max_gapo) c->base.max_gapo = c->base.max_diff;
@@ -238,8 +368,13 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 		size_t so=0, wo=0;
 		for (int i=0;i<n_seqs;i++){ c->rp[i].seq_off=so; c->rp[i].w_off=wo; c->rp[i].len=seqs[i].len; so+=seqs[i].len; wo+=seqs[i].len+1; }
 		c->seq_flat.resize(so); c->w_flat.resize(wo); c->bid_flat.resize(wo); c->has_hit.resize(n_seqs);
+		/* longest-first: max_diff (hence tree size) is a step function of read length */
+		c->order.resize(n_seqs);
+		for (int i=0;i<n_seqs;i++) c->order[i]=i;
+		std::sort(c->order.begin(), c->order.end(),
+		          [&](int a, int b){ return seqs[a].len > seqs[b].len; });
 
-		std::vector<std::thread> ths;   /* MT preprocess (width pre-complement + complement into flat) */
+		std::vector<std::thread> ths;
 		for (int t=0;t<nT;t++) ths.emplace_back([&,t](){
 			std::vector<bwt_width_t> w(c->max_len+1);
 			for (int i=t;i<n_seqs;i+=nT){ bwa_seq_t *p=&seqs[i];
@@ -252,44 +387,18 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 		});
 		for (auto&th:ths) th.join();
 
-		/* GPU stage (serial on main thread) */
-		if (so>cap_seq){ if(d_seq)cudaFree(d_seq); CK(cudaMalloc(&d_seq, so)); cap_seq=so; }
-		if (wo>cap_w){ if(d_ww)cudaFree(d_ww); if(d_wbid)cudaFree(d_wbid); CK(cudaMalloc(&d_ww,wo*8)); CK(cudaMalloc(&d_wbid,wo*4)); cap_w=wo; }
-		if ((size_t)n_seqs>cap_n){ if(d_rp)cudaFree(d_rp); if(d_hit)cudaFree(d_hit); if(d_npop)cudaFree(d_npop); if(d_flag)cudaFree(d_flag);
-			CK(cudaMalloc(&d_rp,n_seqs*sizeof(ReadParam))); CK(cudaMalloc(&d_hit,n_seqs)); CK(cudaMalloc(&d_npop,n_seqs*8));
-			if (do_histo) CK(cudaMalloc(&d_flag,n_seqs)); cap_n=n_seqs; }
-		if (!d_wc){ CK(cudaMalloc(&d_wc,4)); CK(cudaMalloc(&d_nflag,4)); }
-		CK(cudaMemcpy(d_seq, c->seq_flat.data(), so, cudaMemcpyHostToDevice));
-		CK(cudaMemcpy(d_ww, c->w_flat.data(), wo*8, cudaMemcpyHostToDevice));
-		CK(cudaMemcpy(d_wbid, c->bid_flat.data(), wo*4, cudaMemcpyHostToDevice));
-		CK(cudaMemcpy(d_rp, c->rp.data(), n_seqs*sizeof(ReadParam), cudaMemcpyHostToDevice));
-		CK(cudaMemset(d_wc,0,4)); CK(cudaMemset(d_nflag,0,4));
-		double _gk0 = now_s();
-		k_dfs_warp2<<<nblocks, bdim, shbytes>>>(fm, d_seq, d_ww, d_wbid, d_rp, n_seqs,
-			c->base.max_gapo, c->base.max_gape, c->base.mode, c->base.indel_end_skip, c->base.max_del_occ,
-			CAP_SM, CAP_GL, Gk, Gl, Gn, d_hit, d_wc, d_npop, budget, d_nflag, wpb, d_flag);
-		CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
-		if (do_histo) gpu_work_s += now_s() - _gk0;
-		CK(cudaMemcpy(c->has_hit.data(), d_hit, n_seqs, cudaMemcpyDeviceToHost));
-
-		if (do_histo) {   /* per-read-length accumulation (node-pops + flag), bucketed by read length */
-			h_npop.resize(n_seqs); h_flag.resize(n_seqs);
-			CK(cudaMemcpy(h_npop.data(), d_npop, (size_t)n_seqs*8, cudaMemcpyDeviceToHost));
-			CK(cudaMemcpy(h_flag.data(), d_flag, n_seqs, cudaMemcpyDeviceToHost));
-			for (int i=0;i<n_seqs;i++){ int L=c->rp[i].len; if (L<0||L>=MAXL) continue;
-				unsigned long long p=h_npop[i];
-				H_n[L]++; if (c->has_hit[i]) H_hit[L]++; if (h_flag[i]) H_flag[L]++;
-				H_sum[L]+=p; if (p>H_max[L]) H_max[L]=p; if (H_d[L]<0) H_d[L]=c->rp[i].max_diff; }
-		}
-
-		{ std::unique_lock<std::mutex> lk(qmu); q_free.wait(lk, [&]{ return Q.size() < QCAP; }); Q.push(c); }
-		q_ready.notify_one();
+		{ std::unique_lock<std::mutex> lk(cmu); if (seq_id > (int)cslots.size()) cslots.resize(seq_id, NULL); }
+		{ std::unique_lock<std::mutex> lk(rmu); r_free.wait(lk, [&]{ return RQ.size() < RQCAP; }); RQ.push(c); }
+		r_ready.notify_one();
 	}
-	{ std::lock_guard<std::mutex> lk(qmu); done = true; } q_ready.notify_one();
+	{ std::lock_guard<std::mutex> lk(rmu); read_done = true; } r_ready.notify_all();
+	for (auto&w:workers) w.join();
+	{ std::lock_guard<std::mutex> lk(cmu); all_done = true; } c_done_cv.notify_one();
 	cons.join();
 	double total = now_s()-t0;
-	fprintf(stderr, "\n[aln-gpu] DONE: %lld reads in %.1f s = %.0f reads/s; flagged->CPU %lld (%.3f%%)\n",
-		tot, total, tot/total, tot_flag, 100.0*tot_flag/tot);
+	fprintf(stderr, "\n[aln-gpu] DONE: %lld reads in %.1f s = %.0f reads/s; flagged->CPU %lld (%.3f%%); %s %lld (%.2f%%)\n",
+		tot, total, tot/total, tot_flag, 100.0*tot_flag/tot,
+		use_scheme ? "scheme-fallback" : "prefiltered", tot_prefilt, tot>0?100.0*tot_prefilt/tot:0.0);
 
 	if (do_histo) {   /* per-length-band routing report (budget = %llu) */
 		fprintf(stderr, "[histo] budget=%llu  GPU-kernel %.1fs  CPU-reconcile %.1fs  (reconcile/GPU = %.2fx; <1 means it hides under overlap)\n",
@@ -304,6 +413,42 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 				(double)H_sum[L]/H_n[L], H_max[L]);
 		}
 		fprintf(stderr, "[histo] TOTAL reads=%llu  overall flag%%=%.4f\n", agg_n, agg_n? 100.0*agg_flag/agg_n : 0.0);
+		unsigned long long agg_pops=0; for (int L=0;L<MAXL;L++) agg_pops += H_sum[L];
+		fprintf(stderr, "[histo] TOTAL node-pops=%llu  (%.0f/read)  = %.2f G-pops/s over the %.1fs kernel\n",
+			agg_pops, agg_n? (double)agg_pops/agg_n : 0.0, gpu_work_s>0? agg_pops/gpu_work_s/1e9 : 0.0, gpu_work_s);
+#ifdef DFS_INSTRUMENT
+		{	/* FM-probe accounting + (depth, errors) profile of node pops */
+			unsigned long long pr=0, bu=0, po=0, wv=0, spl=0;
+			CK(cudaMemcpyFromSymbol(&wv, g_waves, 8));
+			CK(cudaMemcpyFromSymbol(&spl, g_spills, 8));
+			static unsigned long long dh[DHIST_D*DHIST_E];
+			CK(cudaMemcpyFromSymbol(&pr, g_probes, 8));
+			CK(cudaMemcpyFromSymbol(&bu, g_buckets, 8));
+			CK(cudaMemcpyFromSymbol(&po, g_pops, 8));
+			CK(cudaMemcpyFromSymbol(dh, g_dhist, sizeof(dh)));
+			fprintf(stderr, "[instr] pops=%llu  probes=%llu (%.3f/pop)  buckets=%llu (%.3f/probe)\n",
+				po, pr, po? (double)pr/po : 0.0, bu, pr? (double)bu/pr : 0.0);
+			fprintf(stderr, "[instr] waves=%llu  MEAN ACTIVE LANES = %.2f / 32 (%.0f%% lane utilisation)  spills=%llu (%.3f/wave)\n",
+				wv, wv? (double)po/wv : 0.0, wv? 100.0*((double)po/wv)/32.0 : 0.0, spl, wv? (double)spl/wv : 0.0);
+			fprintf(stderr, "[instr] effective %.3f G-occ4/s vs 2.32 G/s random-gather ceiling = %.0f%% of ceiling\n",
+				gpu_work_s>0? bu/gpu_work_s/1e9 : 0.0, gpu_work_s>0? 100.0*(bu/gpu_work_s/1e9)/2.32 : 0.0);
+			unsigned long long tot_h=0; for (int i=0;i<DHIST_D*DHIST_E;i++) tot_h += dh[i];
+			fprintf(stderr, "[instr] node pops by (depth = read bases consumed, errors used); sampled 1/%d reads, n=%llu\n",
+				DFS_INSTR_MOD, tot_h);
+			fprintf(stderr, "[instr] %5s %10s %6s %6s", "depth", "pops", "%", "cum%");
+			for (int e=0;e<DHIST_E;e++) fprintf(stderr, " %7s%d", "e=", e);
+			fprintf(stderr, "\n");
+			double cum = 0;
+			for (int d=0; d<DHIST_D; d++) {
+				unsigned long long row=0; for (int e=0;e<DHIST_E;e++) row += dh[d*DHIST_E+e];
+				if (!row) continue;
+				double pct = tot_h? 100.0*row/tot_h : 0.0; cum += pct;
+				fprintf(stderr, "[instr] %5d %10llu %6.2f %6.2f", d, row, pct, cum);
+				for (int e=0;e<DHIST_E;e++) fprintf(stderr, " %8llu", dh[d*DHIST_E+e]);
+				fprintf(stderr, "\n");
+			}
+		}
+#endif
 	}
 
 	if (out_fn) fclose(out);

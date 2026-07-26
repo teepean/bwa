@@ -71,6 +71,33 @@ __global__ void k_match(fmidx_dev fm, const uint8_t *seqs, const uint64_t *off,
 	outk[i]=k; outl[i]=l; outc[i]=c;
 }
 
+/* Test C: bidirectional extension. Each thread walks a random query outward from a seed base,
+ * alternating forward/backward extensions, and records the (x0,x1,x2) triple at every step.
+ * The host replays the identical walk with bwa's own bwt_extend() and compares. */
+__global__ void k_biext(fmidx_dev fm, const uint8_t *qs, int qlen, int nq, uint64_t *out /* nq*qlen*3 */)
+{
+	int t = blockIdx.x * blockDim.x + threadIdx.x;
+	if (t >= nq) return;
+	const uint8_t *q = qs + (size_t)t * qlen;
+	bwtintv_dev ik, ok[4];
+	d_bwt_set_intv(fm, q[0], &ik);
+	for (int step = 0; step < qlen - 1; ++step) {
+		int is_back = step & 1;                       /* alternate directions */
+		int c = q[step + 1];
+		d_bwt_extend(fm, &ik, ok, is_back);
+		ik = is_back ? ok[c] : ok[3 - c];             /* forward uses the complement */
+		uint64_t *o = out + ((size_t)t * qlen + step) * 3;
+		o[0] = ik.x0; o[1] = ik.x1; o[2] = ik.x2;
+		if (ik.x2 == 0) {                             /* interval died: pad the rest and stop */
+			for (int r = step + 1; r < qlen - 1; ++r) {
+				uint64_t *z = out + ((size_t)t * qlen + r) * 3;
+				z[0] = z[1] = z[2] = 0;
+			}
+			return;
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 2) { fprintf(stderr,"usage: %s <ref.fa> [reads.fq] [n_random_occ]\n", argv[0]); return 1; }
@@ -164,6 +191,51 @@ int main(int argc, char **argv)
 				(unsigned long long)gk[i],(unsigned long long)gl[i]); bmis++; } }
 		fprintf(stderr, "[B] %s  reads=%d  full-length-exact-hits=%llu  mismatches=%llu\n",
 			bmis?"FAIL":"PASS", nreads, (unsigned long long)nhit, (unsigned long long)bmis);
+	}
+
+	/* ---------- Test C: bidirectional extension vs bwa's own bwt_extend ---------- */
+	{
+		const int QLEN = 24, NQ = 20000;
+		std::vector<uint8_t> q((size_t)NQ * QLEN);
+		uint64_t s2 = 0x9E3779B97F4A7C15ULL;
+		for (size_t i = 0; i < q.size(); ++i) q[i] = (uint8_t)(xorshift64(&s2) & 3);
+		uint8_t *d_q; uint64_t *d_o;
+		CK(cudaMalloc(&d_q, q.size()));
+		CK(cudaMalloc(&d_o, (size_t)NQ * QLEN * 3 * 8));
+		CK(cudaMemset(d_o, 0, (size_t)NQ * QLEN * 3 * 8));
+		CK(cudaMemcpy(d_q, q.data(), q.size(), cudaMemcpyHostToDevice));
+		fmidx_dev fm; fm.bwt = d_bwt; fm.primary = bwt->primary; fm.seq_len = bwt->seq_len;
+		k_biext<<<(NQ+127)/128,128>>>(fm, d_q, QLEN, NQ, d_o);
+		CK(cudaDeviceSynchronize()); CK(cudaGetLastError());
+		std::vector<uint64_t> go((size_t)NQ * QLEN * 3);
+		CK(cudaMemcpy(go.data(), d_o, go.size()*8, cudaMemcpyDeviceToHost));
+
+		uint64_t cmis = 0, nsteps = 0, ndead = 0;
+		for (int t = 0; t < NQ; ++t) {
+			const uint8_t *qq = q.data() + (size_t)t * QLEN;
+			bwtintv_t ik, ok[4];
+			bwt_set_intv(bwt, qq[0], ik);
+			for (int step = 0; step < QLEN - 1; ++step) {
+				int is_back = step & 1, c = qq[step+1];
+				bwt_extend(bwt, &ik, ok, is_back);
+				ik = is_back ? ok[c] : ok[3 - c];
+				const uint64_t *g = &go[((size_t)t * QLEN + step) * 3];
+				++nsteps;
+				if ((uint64_t)ik.x[0]!=g[0] || (uint64_t)ik.x[1]!=g[1] || (uint64_t)ik.x[2]!=g[2]) {
+					if (cmis < 10) fprintf(stderr,
+						"  MISMATCH q%d step%d dir=%d: cpu(%llu,%llu,%llu) gpu(%llu,%llu,%llu)\n",
+						t, step, is_back,
+						(unsigned long long)ik.x[0],(unsigned long long)ik.x[1],(unsigned long long)ik.x[2],
+						(unsigned long long)g[0],(unsigned long long)g[1],(unsigned long long)g[2]);
+					cmis++;
+				}
+				if (ik.x[2] == 0) { ++ndead; break; }
+			}
+		}
+		fprintf(stderr, "[C] %s  bidirectional extend: %d queries, %llu steps compared, "
+		        "%llu died, mismatches=%llu\n", cmis?"FAIL":"PASS", NQ,
+		        (unsigned long long)nsteps, (unsigned long long)ndead, (unsigned long long)cmis);
+		cudaFree(d_q); cudaFree(d_o);
 	}
 
 	cudaFree(d_bwt); cudaFree(d_ks); cudaFree(d_out);

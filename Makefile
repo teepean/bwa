@@ -58,6 +58,11 @@ ALNDEPS=	$(DFSDEPS) bwase.o
 bwa-aln-gpu:libbwa.a $(ALNDEPS) cuda/aln_gpu.cu cuda/fm_device.cuh cuda/dfs_engine.cuh
 		$(NVCC) $(NVCCFLAGS) -DALN_GPU_MAIN -I. cuda/aln_gpu.cu $(ALNDEPS) -o $@ -L. -lbwa $(LIBS)
 
+# instrumented twin: FM-probe accounting + (depth,errors) node-pop profile under GPUALN_HISTO=1.
+# Separate binary so production codegen (register count!) is untouched.
+bwa-aln-gpu-instr:libbwa.a $(ALNDEPS) cuda/aln_gpu.cu cuda/fm_device.cuh cuda/dfs_engine.cuh
+		$(NVCC) $(NVCCFLAGS) -DALN_GPU_MAIN -DDFS_INSTRUMENT -I. cuda/aln_gpu.cu $(ALNDEPS) -o $@ -L. -lbwa $(LIBS)
+
 # CUDA-enabled bwa with the `gpualn` subcommand (default `make` stays CPU-only / CUDA-free)
 aln_gpu.o:cuda/aln_gpu.cu cuda/fm_device.cuh cuda/dfs_engine.cuh
 		$(NVCC) $(NVCCFLAGS) -I. -c cuda/aln_gpu.cu -o $@
@@ -120,3 +125,7 @@ pemerge.o: ksw.h kseq.h malloc_wrap.h kstring.h bwa.h bntseq.h bwt.h utils.h
 rle.o: rle.h
 rope.o: rle.h rope.h
 utils.o: utils.h ksort.h malloc_wrap.h kseq.h
+
+# Idea-A cost probe: bidirectional staircase search, node-pop counts by anchor position
+bidir_cost:libbwa.a cuda/bidir_cost.cu cuda/fm_device.cuh
+		$(NVCC) $(NVCCFLAGS) -I. cuda/bidir_cost.cu -o $@ -L. -lbwa $(LIBS)
