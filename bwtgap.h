@@ -32,6 +32,11 @@ extern "C" {
 	bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_width_t *w,
 							  bwt_width_t *seed_w, const gap_opt_t *opt, int *_n_aln, gap_stack_t *stack);
 	void bwa_aln2seq(int n_aln, const bwt_aln1_t *aln, bwa_seq_t *s);
+	/* interleaves nb independent reads in one thread so their FM-index cache misses overlap;
+	 * bit-exact with calling bwt_match_gap on each read separately. Needs one stack per read. */
+	void bwt_match_gap_batch(bwt_t *const bwt, int nb, const int *len, const ubyte_t **seq,
+	                         bwt_width_t **width, bwt_width_t **seed_width, const gap_opt_t **opt,
+	                         gap_stack_t **stacks, bwt_aln1_t **aln_out, int *n_aln_out);
 
 #ifdef __cplusplus
 }

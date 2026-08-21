@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "bwtgap.h"
+#define BWT_GAP_BATCH_MAX 8
 #include "bwtaln.h"
 
 #ifdef USE_MALLOC_WRAPPERS
@@ -169,147 +170,143 @@ static inline int int_log2(uint32_t v)
 	return c;
 }
 
-bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_width_t *width,
-						  bwt_width_t *seed_width, const gap_opt_t *opt, int *_n_aln, gap_stack_t *stack)
-{ // $seq is the reverse complement of the input read
-	int best_score = aln_score(opt->max_diff+1, opt->max_gapo+1, opt->max_gape+1, opt);
-	int best_diff = opt->max_diff + 1, max_diff = opt->max_diff;
-	int best_cnt = 0;
-	int max_entries = 0, j, _j, n_aln, m_aln;
+/* ---- batched reconcile -------------------------------------------------------------
+ * bwt_match_gap is latency-bound on random probes into a multi-GB index: measured thread scaling
+ * is 81% efficient out to 16 cores and SMT still buys 1.35x, i.e. the pipeline is full of stall
+ * cycles rather than saturating a shared resource. Interleaving several INDEPENDENT reads within
+ * one thread lets their cache misses overlap.
+ *
+ * The search is factored into init + step so the single-read and batched paths execute the SAME
+ * body and cannot drift. Interleaving cannot change any individual read's result -- each run owns
+ * its stack and state, and steps in the same order -- so the batched path is bit-exact.
+ */
+typedef struct {
+	bwt_t *bwt; int len; const ubyte_t *seq; bwt_width_t *width, *seed_width;
+	const gap_opt_t *opt; gap_stack_t *stack;
+	int best_score, best_diff, max_diff, best_cnt, max_entries, n_aln, m_aln;
 	bwt_aln1_t *aln;
-#ifdef ALN_PROFILE
-	long long n_pop = 0; int hit_cap = 0;
-#endif
+	long long n_pop; int hit_cap;
+	int done;
+} gap_run_t;
 
-	m_aln = 4; n_aln = 0;
-	aln = (bwt_aln1_t*)calloc(m_aln, sizeof(bwt_aln1_t));
+/* one iteration of the former while-loop; 1 = keep stepping, 0 = this read is finished */
+static int gap_run_step(gap_run_t *r)
+{
+	int j;
+	if (r->stack->n_entries == 0) return 0;
+	(void)j;
+	{
 
-	// check whether there are too many N
-	for (j = _j = 0; j < len; ++j)
-		if (seq[j] > 3) ++_j;
-	if (_j > max_diff) {
-		*_n_aln = n_aln;
-#ifdef ALN_PROFILE
-		aln_prof_record(0, 0, 0, n_aln);
-#endif
-		return aln;
-	}
-
-	//for (j = 0; j != len; ++j) printf("#0 %d: [%d,%u]\t[%d,%u]\n", j, w[0][j].bid, w[0][j].w, w[1][j].bid, w[1][j].w);
-	gap_reset_stack(stack); // reset stack
-	gap_push(bwt, stack, len, 0, bwt->seq_len, 0, 0, 0, 0, 0, 0, 0, opt);
-
-	while (stack->n_entries) {
 		gap_entry_t e;
 		int i, m, m_seed = 0, hit_found, allow_diff, allow_M, tmp;
 		bwtint_t k, l, cnt_k[4], cnt_l[4], occ;
 
-		if (max_entries < stack->n_entries) max_entries = stack->n_entries;
+		if (r->max_entries < r->stack->n_entries) r->max_entries = r->stack->n_entries;
 #ifdef ALN_PROFILE
-		++n_pop;
-		if (stack->n_entries > opt->max_entries) { hit_cap = 1; break; }
+		++r->n_pop;
+		if (r->stack->n_entries > r->opt->max_entries) { r->hit_cap = 1; return 0; }
 #else
-		if (stack->n_entries > opt->max_entries) break;
+		if (r->stack->n_entries > r->opt->max_entries) return 0;
 #endif
-		gap_pop(bwt, stack, &e); // get the best entry
+		gap_pop(r->bwt, r->stack, &e); // get the best entry
 		k = e.k; l = e.l; // SA interval
 		i = e.info&0xffff; // length
-		if (!(opt->mode & BWA_MODE_NONSTOP) && e.info>>21 > best_score + opt->s_mm) break; // no need to proceed
+		if (!(r->opt->mode & BWA_MODE_NONSTOP) && e.info>>21 > r->best_score + r->opt->s_mm) return 0; // no need to proceed
 
-		m = max_diff - (e.n_mm + e.n_gapo);
-		if (opt->mode & BWA_MODE_GAPE) m -= e.n_gape;
-		if (m < 0) continue;
-		if (seed_width) { // apply seeding
-			m_seed = opt->max_seed_diff - (e.n_mm + e.n_gapo);
-			if (opt->mode & BWA_MODE_GAPE) m_seed -= e.n_gape;
+		m = r->max_diff - (e.n_mm + e.n_gapo);
+		if (r->opt->mode & BWA_MODE_GAPE) m -= e.n_gape;
+		if (m < 0) return 1;
+		if (r->seed_width) { // apply seeding
+			m_seed = r->opt->max_seed_diff - (e.n_mm + e.n_gapo);
+			if (r->opt->mode & BWA_MODE_GAPE) m_seed -= e.n_gape;
 		}
-		//printf("#1\t[%d,%d,%d,%c]\t[%d,%d,%d]\t[%u,%u]\t[%u,%u]\t%d\n", stack->n_entries, a, i, "MID"[e.state], e.n_mm, e.n_gapo, e.n_gape, width[i-1].bid, width[i-1].w, k, l, e.last_diff_pos);
-		if (i > 0 && m < width[i-1].bid) continue;
+		//printf("#1\t[%d,%d,%d,%c]\t[%d,%d,%d]\t[%u,%u]\t[%u,%u]\t%d\n", r->stack->n_entries, a, i, "MID"[e.state], e.n_mm, e.n_gapo, e.n_gape, r->width[i-1].bid, r->width[i-1].w, k, l, e.last_diff_pos);
+		if (i > 0 && m < r->width[i-1].bid) return 1;
 
 		// check whether a hit is found
 		hit_found = 0;
 		if (i == 0) hit_found = 1;
-		else if (m == 0 && (e.state == STATE_M || (opt->mode&BWA_MODE_GAPE) || e.n_gape == opt->max_gape)) { // no diff allowed
-			if (bwt_match_exact_alt(bwt, i, seq, &k, &l)) hit_found = 1;
-			else continue; // no hit, skip
+		else if (m == 0 && (e.state == STATE_M || (r->opt->mode&BWA_MODE_GAPE) || e.n_gape == r->opt->max_gape)) { // no diff allowed
+			if (bwt_match_exact_alt(r->bwt, i, r->seq, &k, &l)) hit_found = 1;
+			else return 1; // no hit, skip
 		}
 
 		if (hit_found) { // action for found hits
-			int score = aln_score(e.n_mm, e.n_gapo, e.n_gape, opt);
+			int score = aln_score(e.n_mm, e.n_gapo, e.n_gape, r->opt);
 			int do_add = 1;
 			//printf("#2 hits found: %d:(%u,%u)\n", e.n_mm+e.n_gapo, k, l);
-			if (n_aln == 0) {
-				best_score = score;
-				best_diff = e.n_mm + e.n_gapo;
-				if (opt->mode & BWA_MODE_GAPE) best_diff += e.n_gape;
-				if (!(opt->mode & BWA_MODE_NONSTOP))
-					max_diff = (best_diff + 1 > opt->max_diff)? opt->max_diff : best_diff + 1; // top2 behaviour
+			if (r->n_aln == 0) {
+				r->best_score = score;
+				r->best_diff = e.n_mm + e.n_gapo;
+				if (r->opt->mode & BWA_MODE_GAPE) r->best_diff += e.n_gape;
+				if (!(r->opt->mode & BWA_MODE_NONSTOP))
+					r->max_diff = (r->best_diff + 1 > r->opt->max_diff)? r->opt->max_diff : r->best_diff + 1; // top2 behaviour
 			}
-			if (score == best_score) best_cnt += l - k + 1;
-			else if (best_cnt > opt->max_top2) break; // top2b behaviour
+			if (score == r->best_score) r->best_cnt += l - k + 1;
+			else if (r->best_cnt > r->opt->max_top2) return 0; // top2b behaviour
 			if (e.n_gapo) { // check whether the hit has been found. this may happen when a gap occurs in a tandem repeat
-				for (j = 0; j != n_aln; ++j)
-					if (aln[j].k == k && aln[j].l == l) break;
-				if (j < n_aln) do_add = 0;
+				for (j = 0; j != r->n_aln; ++j)
+					if (r->aln[j].k == k && r->aln[j].l == l) break;
+				if (j < r->n_aln) do_add = 0;
 			}
 			if (do_add) { // append
 				bwt_aln1_t *p;
-				gap_shadow(l - k + 1, len, bwt->seq_len, e.last_diff_pos, width);
-				if (n_aln == m_aln) {
-					m_aln <<= 1;
-					aln = (bwt_aln1_t*)realloc(aln, m_aln * sizeof(bwt_aln1_t));
-					memset(aln + m_aln/2, 0, m_aln/2*sizeof(bwt_aln1_t));
+				gap_shadow(l - k + 1, r->len, r->bwt->seq_len, e.last_diff_pos, r->width);
+				if (r->n_aln == r->m_aln) {
+					r->m_aln <<= 1;
+					r->aln = (bwt_aln1_t*)realloc(r->aln, r->m_aln * sizeof(bwt_aln1_t));
+					memset(r->aln + r->m_aln/2, 0, r->m_aln/2*sizeof(bwt_aln1_t));
 				}
-				p = aln + n_aln;
+				p = r->aln + r->n_aln;
 				p->n_mm = e.n_mm; p->n_gapo = e.n_gapo; p->n_gape = e.n_gape;
 				p->n_ins = e.n_ins; p->n_del = e.n_del;
 				p->k = k; p->l = l;
 				p->score = score;
 				//fprintf(stderr, "*** n_mm=%d,n_gapo=%d,n_gape=%d,n_ins=%d,n_del=%d\n", e.n_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del);
-				++n_aln;
+				++r->n_aln;
 			}
-			continue;
+			return 1;
 		}
 
 		--i;
-		bwt_2occ4(bwt, k - 1, l, cnt_k, cnt_l); // retrieve Occ values
+		bwt_2occ4(r->bwt, k - 1, l, cnt_k, cnt_l); // retrieve Occ values
 		occ = l - k + 1;
 		// test whether diff is allowed
 		allow_diff = allow_M = 1;
 		if (i > 0) {
-			int ii = i - (len - opt->seed_len);
-			if (width[i-1].bid > m-1) allow_diff = 0;
-			else if (width[i-1].bid == m-1 && width[i].bid == m-1 && width[i-1].w == width[i].w) allow_M = 0;
-			if (seed_width && ii > 0) {
-				if (seed_width[ii-1].bid > m_seed-1) allow_diff = 0;
-				else if (seed_width[ii-1].bid == m_seed-1 && seed_width[ii].bid == m_seed-1
-						 && seed_width[ii-1].w == seed_width[ii].w) allow_M = 0;
+			int ii = i - (r->len - r->opt->seed_len);
+			if (r->width[i-1].bid > m-1) allow_diff = 0;
+			else if (r->width[i-1].bid == m-1 && r->width[i].bid == m-1 && r->width[i-1].w == r->width[i].w) allow_M = 0;
+			if (r->seed_width && ii > 0) {
+				if (r->seed_width[ii-1].bid > m_seed-1) allow_diff = 0;
+				else if (r->seed_width[ii-1].bid == m_seed-1 && r->seed_width[ii].bid == m_seed-1
+						 && r->seed_width[ii-1].w == r->seed_width[ii].w) allow_M = 0;
 			}
 		}
 		// indels
-		tmp = (opt->mode & BWA_MODE_LOGGAP)? int_log2(e.n_gape + e.n_gapo)/2+1 : e.n_gapo + e.n_gape;
-		if (allow_diff && i >= opt->indel_end_skip + tmp && len - i >= opt->indel_end_skip + tmp) {
+		tmp = (r->opt->mode & BWA_MODE_LOGGAP)? int_log2(e.n_gape + e.n_gapo)/2+1 : e.n_gapo + e.n_gape;
+		if (allow_diff && i >= r->opt->indel_end_skip + tmp && r->len - i >= r->opt->indel_end_skip + tmp) {
 			if (e.state == STATE_M) { // gap open
-				if (e.n_gapo < opt->max_gapo) { // gap open is allowed
+				if (e.n_gapo < r->opt->max_gapo) { // gap open is allowed
 					// insertion
-					gap_push(bwt, stack, i, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
+					gap_push(r->bwt, r->stack, i, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins + 1, e.n_del, STATE_I, 1, r->opt);
 					// deletion
 					for (j = 0; j != 4; ++j) {
-						k = bwt->L2[j] + cnt_k[j] + 1;
-						l = bwt->L2[j] + cnt_l[j];
-						if (k <= l) gap_push(bwt, stack, i + 1, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+						k = r->bwt->L2[j] + cnt_k[j] + 1;
+						l = r->bwt->L2[j] + cnt_l[j];
+						if (k <= l) gap_push(r->bwt, r->stack, i + 1, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins, e.n_del + 1, STATE_D, 1, r->opt);
 					}
 				}
 			} else if (e.state == STATE_I) { // extention of an insertion
-				if (e.n_gape < opt->max_gape) // gap extention is allowed
-					gap_push(bwt, stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
+				if (e.n_gape < r->opt->max_gape) // gap extention is allowed
+					gap_push(r->bwt, r->stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins + 1, e.n_del, STATE_I, 1, r->opt);
 			} else if (e.state == STATE_D) { // extention of a deletion
-				if (e.n_gape < opt->max_gape) { // gap extention is allowed
-					if (e.n_gape + e.n_gapo < max_diff || occ < opt->max_del_occ) {
+				if (e.n_gape < r->opt->max_gape) { // gap extention is allowed
+					if (e.n_gape + e.n_gapo < r->max_diff || occ < r->opt->max_del_occ) {
 						for (j = 0; j != 4; ++j) {
-							k = bwt->L2[j] + cnt_k[j] + 1;
-							l = bwt->L2[j] + cnt_l[j];
-							if (k <= l) gap_push(bwt, stack, i + 1, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+							k = r->bwt->L2[j] + cnt_k[j] + 1;
+							l = r->bwt->L2[j] + cnt_l[j];
+							if (k <= l) gap_push(r->bwt, r->stack, i + 1, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins, e.n_del + 1, STATE_D, 1, r->opt);
 						}
 					}
 				}
@@ -318,24 +315,89 @@ bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_wid
 		// mismatches
 		if (allow_diff && allow_M) { // mismatch is allowed
 			for (j = 1; j <= 4; ++j) {
-				int c = (seq[i] + j) & 3;
-				int is_mm = (j != 4 || seq[i] > 3);
-				k = bwt->L2[c] + cnt_k[c] + 1;
-				l = bwt->L2[c] + cnt_l[c];
-				if (k <= l) gap_push(bwt, stack, i, k, l, e.n_mm + is_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, is_mm, opt);
+				int c = (r->seq[i] + j) & 3;
+				int is_mm = (j != 4 || r->seq[i] > 3);
+				k = r->bwt->L2[c] + cnt_k[c] + 1;
+				l = r->bwt->L2[c] + cnt_l[c];
+				if (k <= l) gap_push(r->bwt, r->stack, i, k, l, e.n_mm + is_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, is_mm, r->opt);
 			}
-		} else if (seq[i] < 4) { // try exact match only
-			int c = seq[i] & 3;
-			k = bwt->L2[c] + cnt_k[c] + 1;
-			l = bwt->L2[c] + cnt_l[c];
-			if (k <= l) gap_push(bwt, stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, 0, opt);
+		} else if (r->seq[i] < 4) { // try exact match only
+			int c = r->seq[i] & 3;
+			k = r->bwt->L2[c] + cnt_k[c] + 1;
+			l = r->bwt->L2[c] + cnt_l[c];
+			if (k <= l) gap_push(r->bwt, r->stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, 0, r->opt);
+		}
+	
+	}
+	return 1;
+}
+
+/* Prefetch the Occ buckets the next pop will touch. The batch loop issues these for EVERY read
+ * before stepping any of them, so the distance to use is a whole round of other reads' work --
+ * far longer than anything achievable inside a single dependent chain. */
+static inline void gap_run_prefetch(const gap_run_t *r)
+{
+	const gap_stack_t *s = r->stack;
+	const gap_stack1_t *q;
+	const gap_entry_t *e;
+	if (!s->n_entries) return;
+	q = s->stacks + s->best;
+	if (!q->n_entries) return;
+	e = q->stack + (q->n_entries - 1);
+	if (e->k) __builtin_prefetch(bwt_occ_intv(r->bwt, e->k - 1), 0, 3);
+	__builtin_prefetch(bwt_occ_intv(r->bwt, e->l), 0, 3);
+}
+
+static void gap_run_init(gap_run_t *r, bwt_t *const bwt, int len, const ubyte_t *seq,
+                         bwt_width_t *width, bwt_width_t *seed_width, const gap_opt_t *opt,
+                         gap_stack_t *stack)
+{
+	int j, _j;
+	r->bwt = bwt; r->len = len; r->seq = seq; r->width = width; r->seed_width = seed_width;
+	r->opt = opt; r->stack = stack;
+	r->best_score = aln_score(opt->max_diff+1, opt->max_gapo+1, opt->max_gape+1, opt);
+	r->best_diff = opt->max_diff + 1; r->max_diff = opt->max_diff;
+	r->best_cnt = 0; r->max_entries = 0; r->n_pop = 0; r->hit_cap = 0;
+	r->m_aln = 4; r->n_aln = 0;
+	r->aln = (bwt_aln1_t*)calloc(r->m_aln, sizeof(bwt_aln1_t));
+	r->done = 0;
+	for (j = _j = 0; j < len; ++j) if (seq[j] > 3) ++_j;
+	if (_j > r->max_diff) { r->done = 1; return; }
+	gap_reset_stack(stack);
+	gap_push(bwt, stack, len, 0, bwt->seq_len, 0, 0, 0, 0, 0, 0, 0, opt);
+}
+
+/* Run nb independent reads interleaved in one thread; each needs its own gap_stack_t.
+ * aln_out[i]/n_aln_out[i] receive exactly what bwt_match_gap would have returned for read i. */
+void bwt_match_gap_batch(bwt_t *const bwt, int nb, const int *len, const ubyte_t **seq,
+                         bwt_width_t **width, bwt_width_t **seed_width, const gap_opt_t **opt,
+                         gap_stack_t **stacks, bwt_aln1_t **aln_out, int *n_aln_out)
+{
+	gap_run_t r[BWT_GAP_BATCH_MAX];
+	int i, active = 0;
+	if (nb > BWT_GAP_BATCH_MAX) nb = BWT_GAP_BATCH_MAX;
+	for (i = 0; i < nb; ++i) {
+		gap_run_init(&r[i], bwt, len[i], seq[i], width[i], seed_width ? seed_width[i] : 0, opt[i], stacks[i]);
+		if (!r[i].done) ++active;
+	}
+	while (active) {
+		for (i = 0; i < nb; ++i) if (!r[i].done) gap_run_prefetch(&r[i]);
+		for (i = 0; i < nb; ++i) if (!r[i].done) {
+			if (!gap_run_step(&r[i])) { r[i].done = 1; --active; }
 		}
 	}
+	for (i = 0; i < nb; ++i) { aln_out[i] = r[i].aln; n_aln_out[i] = r[i].n_aln; }
+}
 
-	*_n_aln = n_aln;
-	//fprintf(stderr, "max_entries = %d\n", max_entries);
+bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_width_t *width,
+						  bwt_width_t *seed_width, const gap_opt_t *opt, int *_n_aln, gap_stack_t *stack)
+{ // $seq is the reverse complement of the input read
+	gap_run_t r;
+	gap_run_init(&r, bwt, len, seq, width, seed_width, opt, stack);
+	while (!r.done) { gap_run_prefetch(&r); if (!gap_run_step(&r)) break; }
+	*_n_aln = r.n_aln;
 #ifdef ALN_PROFILE
-	aln_prof_record(max_entries, n_pop, hit_cap, n_aln);
+	aln_prof_record(r.max_entries, r.n_pop, r.hit_cap, r.n_aln);
 #endif
-	return aln;
+	return r.aln;
 }

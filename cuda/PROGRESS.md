@@ -1314,3 +1314,67 @@ rate matched, and still lost. **Per-lane MLP is not the lever for this kernel. D
 What survives: the 12-byte node packing itself is validated and bit-exact, should a future design
 need 40% less stack memory. `cuda/dual_engine.cuh` is opt-in (`GPUALN_DUAL=1`); production is
 untouched.
+
+## Phase 20 — CPU reconcile: batched (interleaved) search, and a bwa property worth knowing
+
+Phase 15 put the CPU reconcile at 98.9% of the short-read stage on high-endogenous samples, so it
+is the right target. Benchmark: 1 M hit-heavy reads (`TAN004.short.bam` -> fastq; coordinate-sorted
+so the head is all mapped), metric = the `GPUALN_HISTO` `CPU-reconcile` timer.
+
+### Thread scaling says there ARE stalls to fill
+| threads | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|
+| reconcile | 62.32 s | 34.64 s | 19.36 s | 14.33 s |
+
+81% efficient out to 16 cores (no shared resource saturating) and SMT still buys 1.35x -- i.e. the
+pipeline is full of memory stalls, so more memory-level parallelism per thread should help.
+
+### Batched reconcile -- built, bit-exact, modest
+`bwt_match_gap` factored into **init + step** (`gap_run_t`, `gap_run_init`, `gap_run_step`), so the
+single-read and batched paths execute the SAME body and cannot drift. `bwt_match_gap_batch()` runs
+`nb` independent reads round-robin, issuing `gap_run_prefetch` for ALL of them before stepping any
+-- so the distance from prefetch to use is a whole round of other reads' work, far longer than
+anything reachable inside one dependent chain. Each run needs its own stack, its own width buffer
+(`gap_shadow` MUTATES it) and its own `gap_opt_t` (`max_diff` varies with read length).
+Interleaving cannot change any single read's result, so it is bit-exact by construction.
+Knob: `GPUALN_BATCH=N` (1..8, default 1).
+
+| threads | batch=1 | batch=4 | gain |
+|---|---|---|---|
+| 4 | 63.70 s | 56.52 s | **1.13x** |
+| 16 | 19.80 s | 17.96 s | **1.10x** |
+| 32 | 14.58 s | 14.24 s | 1.02x |
+
+It helps only where stalls remain: by 32 threads SMT has already filled them. Nowhere near
+QuadRank's 2x, because SMT and the Phase-16 pop-side prefetch already capture much of it, and
+bwa's per-node work (child generation, pushes) is more than a bare rank query.
+
+### The larger practical win is the thread count
+`-t 32` beats `-t 16` by **1.36x** on the reconcile (19.80 -> 14.58 s), which dwarfs batching.
+`-t 32` + `batch=8` = 14.02 s vs the pipeline's current `-t 16` + `batch=1` = 19.80 s: **1.41x**.
+
+### CAUTION -- bwa's .sai is NOT thread-count invariant (upstream, not ours)
+Found while validating: `.sai` output depends on `-t`.
+| -t | 8 | 16 | 32 |
+|---|---|---|---|
+| `bwa gpualn` | 92508542 | 4b068014 | 8b6332b9 |
+| **CPU `bwa aln`** | 92508542 | 4b068014 | 8b6332b9 |
+
+**Identical -- this is upstream bwa behaviour**, reproduced faithfully by the port; it is present in
+the committed pre-batch build too, so the refactor did not cause it. It is **deterministic at a
+fixed thread count** (3/3 identical runs at both -t 16 and -t 32), so it is a thread-partition
+effect, not a race. Magnitude is tiny: **1 byte differs out of 8404** on sub2k.
+Mechanism not pinned down; `bwa_cal_sa_reg_gap` assigns reads by `i % opt->n_threads != tid` and
+reuses a per-thread `w` buffer that is only memset when it grows, which is the obvious suspect, but
+every access appeared to stay inside the freshly written `[0..len]` range, so this is unconfirmed.
+
+Consequences:
+1. **Bit-exactness claims must fix `-t`.** Every golden in this project was made at `-t 16` and all
+   validation has used `-t 16`, so nothing recorded is invalidated.
+2. This is a **stronger** result than before: gpualn now matches CPU bwa at `-t 8`, `16` AND `32`,
+   three independent thread partitions, not just one.
+3. Switching to `-t 32` for the 1.36x is safe *in the same sense bwa itself is* -- but it will
+   change the `.sai` by a byte or so versus a `-t 16` golden. Regenerate goldens if you switch.
+
+Validated at `-t 16`: sub2k `4b068014` and sub100k `eecf35c1` for batch = 1/2/4/8, `bwa gpualn`
+with scheme+batch `eecf35c1`, CPU `bwa aln` `eecf35c1`, dfstest false_neg=0.

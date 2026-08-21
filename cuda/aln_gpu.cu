@@ -129,7 +129,9 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 	int do_histo = getenv("GPUALN_HISTO") != NULL;
 	int use_order = getenv("GPUALN_NOORDER") ? 0 : 1;
 	int use_scheme = getenv("GPUALN_SCHEME") ? 1 : 0;
-	int use_dual = getenv("GPUALN_DUAL") ? 1 : 0;   /* two reads/warp -> per-lane MLP=2 */   /* bidirectional search-scheme engine */   /* longest-first scheduling (A/B knob) */   /* opt-in per-length-band node-pop/flag histogram */
+	int use_dual = getenv("GPUALN_DUAL") ? 1 : 0;
+	int bat = getenv("GPUALN_BATCH") ? atoi(getenv("GPUALN_BATCH")) : 1;   /* reads interleaved per reconcile thread */
+	if (bat < 1) bat = 1; if (bat > 8) bat = 8;   /* two reads/warp -> per-lane MLP=2 */   /* bidirectional search-scheme engine */   /* longest-first scheduling (A/B knob) */   /* opt-in per-length-band node-pop/flag histogram */
 
 	char bwt_fn[4096]; snprintf(bwt_fn, sizeof bwt_fn, "%s.bwt", prefix);
 	fprintf(stderr, "[aln-gpu] loading %s\n", bwt_fn);
@@ -320,16 +322,34 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 			std::vector<std::thread> ths;
 			double _rc0 = now_s();
 			for (int t=0;t<nT;t++) ths.emplace_back([&,t](){
-				gap_stack_t *st = gap_init_stack(c->stack_maxdiff, c->base.max_gapo, c->base.max_gape, &c->base);
-				std::vector<bwt_width_t> w(c->max_len+1);
-				for (size_t x=t;x<idx.size();x+=nT){
-					int i=idx[x], len=c->rp[i].len;
-					for (int j=0;j<=len;j++){ w[j].w=c->w_flat[c->rp[i].w_off+j]; w[j].bid=c->bid_flat[c->rp[i].w_off+j]; }
-					gap_opt_t lo=c->base; lo.max_diff=c->rp[i].max_diff; lo.seed_len = opt->seed_len<len?opt->seed_len:0x7fffffff;
-					int na=0; aln[i]=bwt_match_gap(bwt, len, c->seq_flat.data()+c->rp[i].seq_off, w.data(), (bwt_width_t*)0, &lo, &na, st);
-					n_aln[i]=na;
+				/* Batched reconcile: interleave `bat` independent reads in this thread so their
+				 * FM-index cache misses overlap (bwt_match_gap is latency-bound). Each read needs
+				 * its OWN stack, width buffer (gap_shadow mutates it) and opt (max_diff varies with
+				 * read length). Results are stored per read index, so which thread takes which read
+				 * does not affect output -- bit-exact. */
+				std::vector<gap_stack_t*> st(bat);
+				std::vector<std::vector<bwt_width_t> > wb(bat);
+				std::vector<gap_opt_t> lo(bat);
+				for (int b=0;b<bat;b++){ st[b]=gap_init_stack(c->stack_maxdiff, c->base.max_gapo, c->base.max_gape, &c->base);
+					wb[b].resize(c->max_len+1); }
+				std::vector<const ubyte_t*> sq(bat); std::vector<int> ln(bat);
+				std::vector<bwt_width_t*> wp(bat); std::vector<const gap_opt_t*> op(bat);
+				std::vector<bwt_aln1_t*> ao(bat); std::vector<int> no(bat);
+				for (size_t x=(size_t)t*bat; x<idx.size(); x+=(size_t)nT*bat){
+					int nb=0;
+					for (int b=0;b<bat && x+b<idx.size(); ++b, ++nb){
+						int i=idx[x+b], len=c->rp[i].len;
+						for (int j=0;j<=len;j++){ wb[b][j].w=c->w_flat[c->rp[i].w_off+j]; wb[b][j].bid=c->bid_flat[c->rp[i].w_off+j]; }
+						lo[b]=c->base; lo[b].max_diff=c->rp[i].max_diff;
+						lo[b].seed_len = opt->seed_len<len?opt->seed_len:0x7fffffff;
+						sq[b]=c->seq_flat.data()+c->rp[i].seq_off; ln[b]=len; wp[b]=wb[b].data(); op[b]=&lo[b];
+					}
+					if (nb==1) { int na=0; ao[0]=bwt_match_gap(bwt, ln[0], sq[0], wp[0], (bwt_width_t*)0, op[0], &na, st[0]); no[0]=na; }
+					else bwt_match_gap_batch(bwt, nb, ln.data(), sq.data(), wp.data(), (bwt_width_t**)0,
+					                         op.data(), st.data(), ao.data(), no.data());
+					for (int b=0;b<nb;b++){ int i=idx[x+b]; aln[i]=ao[b]; n_aln[i]=no[b]; }
 				}
-				gap_destroy_stack(st);
+				for (int b=0;b<bat;b++) gap_destroy_stack(st[b]);
 			});
 			for (auto&th:ths) th.join();
 			if (do_histo) recon_s += now_s() - _rc0;
