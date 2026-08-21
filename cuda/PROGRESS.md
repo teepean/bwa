@@ -1211,3 +1211,106 @@ The prefetch distance is bounded by one node expansion, which is short against a
 miss. The larger lever is QuadRank-style **batching**: interleave several reads per thread so an
 independent read's probe issues while another waits. That needs `bwt_match_gap` restructured into a
 resumable state machine (N independent `gap_stack_t` round-robined) -- mechanical but invasive.
+
+## Phase 17 — measuring in-flight capacity: the MLP direction was closed too early
+
+An NVIDIA-hosted CUDA assistant claimed the sm_86 throughput collapse is caused by a
+"32-entry load-queue/MSHR pool per SM, publicly confirmed in the CUDA C++ Programming Guide".
+**That citation does not exist** -- the Programming Guide's Technical Specifications tables
+(Table 30/31) list warp size, registers/SM, shared memory/SM, shared-memory banks, and so on, but
+have no row for in-flight memory requests, MSHR depth, or load-queue depth. NVIDIA does not publish
+that number. (Same source also insisted `cp.async` is Hopper-only -- it is CC 8.0+/`LDGSTS`; TMA is
+CC 9.0+ -- and proposed splitting a 64 B load into two 32 B loads to "halve request pressure",
+which doubles the request count.)
+
+The hypothesis was testable regardless, so it was tested directly.
+
+### `/tmp/mlp.cu` -- occupancy fixed at 8 warps/SM, independent loads per thread varied
+| MLP | throughput | in-flight/SM |
+|---|---|---|
+| 1 | 2,375 M/s (152 GB/s) | 256 |
+| **2** | **7,355 M/s (471 GB/s)** | 512 |
+| 4 | 7,257 M/s | 1,024 |
+| 8 | 7,359 M/s | 2,048 |
+| 16 | 7,361 M/s | 4,096 |
+
+A 32-entry queue would have flattened the curve at MLP=1 (256 outstanding >> 32). Instead
+**MLP 1->2 triples throughput**; saturation is somewhere near 256-512 outstanding per SM, an order
+of magnitude above the claim.
+
+**This also corrects our own D6 number.** The "374 GB/s at 8 warps/SM" figure recorded earlier
+understated the ceiling: that benchmark did not carry enough independent loads. The real peak at
+8 warps/SM is **471 GB/s**.
+
+### Consequence: the Phase-9 MLP rejection was right about the experiment, wrong about the direction
+NPL=2 measured 0.90-0.95x and the direction was recorded as "closed". The measurement was sound but
+the conclusion overreached: both slots drew from **the same read's frontier**, which self-limits at
+~28 nodes (28.35 pops/wave against a capacity of 64), so slot B was nearly always empty. **MLP=2 was
+never actually achieved** -- the run paid the register cost and got no extra memory parallelism.
+
+Genuine MLP=2 is worth ~3x on the memory side. The kernel currently runs ~1.18 G-occ4/s against
+2.38 G/s for MLP=1, and its request stream is bursty (issue ~208, wait for all, compute, repeat), so
+average in-flight sits below even the MLP=1 level.
+
+**The independence has to come from a second READ, not a second node of the same frontier.**
+Note splitting the warp 16/16 across two reads does NOT work: MLP is per-thread, so 32 lanes with
+one load each is still the MLP=1 point. Two nodes per LANE, from two different reads, is required.
+Pairing is cheap because reads are already handed out longest-first, so adjacent reads have similar
+tree sizes and a paired slot idles less.
+
+## Phase 18/19 — dual-read MLP=2: BUILT TWICE, REFUTED. The direction is closed.
+
+Phase 17 measured that per-lane MLP 1->2 triples random-gather throughput at 8 warps/SM
+(2,375 -> 7,355 M-probe/s). Two engines were built to capture it. Both are bit-exact; neither wins.
+
+### Attempt 1 (Phase 18) -- dual-read, 20-byte nodes
+Two reads per warp so the second node comes from an INDEPENDENT frontier (the Phase-9 failure was
+that both slots drew from one read's frontier, which self-limits at ~28 nodes). Reads are paired
+adjacently, which is cheap because the pool already hands them out longest-first, so a pair has
+similar tree sizes and the second slot idles less.
+
+| config | kernel | reconcile | end-to-end | flagged |
+|---|---|---|---|---|
+| DUAL CAP=512 | 2.502 s | 5.204 s | 7.8 s (12,871 r/s) | 3.49% |
+| DUAL CAP=256 | 0.842 s | 13.537 s | 14.4 s (6,925 r/s) | 38.1% |
+| SINGLE CAP=512 | 1.874 s | 0.461 s | **2.4 s (41,759 r/s)** | 0.52% |
+
+**CAP=256's "2.2x faster kernel" is a mirage** -- it is fast because it punts 38% of reads to a
+13.5 s CPU reconcile. Same trap as the Phase-2 CAP=640 result. Kernel time alone is not a metric here.
+
+Root cause of the CAP=512 loss is arithmetic, not implementation: two 20-byte stacks per warp halve
+occupancy to 4 warps/SM, so 4 x 26 x MLP2 = 208 outstanding -- **identical** to 8 x 26 x MLP1 -- while
+giving up warp-level latency hiding.
+
+### Attempt 2 (Phase 19) -- 12-byte nodes, to reach MLP=2 at FULL occupancy
+`k, l < seq_len (6.27e9) < 2^33` => 33+33 bits; `i(9) mm(6) gapo(4) gape(4) state(2)` => 25 bits;
+91 bits total, stored as 3 x uint32 = **12 bytes** (was 20). Two stacks x 512 x 12 B = 12 KB/warp ->
+48 KB/block -> 2 blocks/SM -> **8 warps/SM with two reads each = 512 outstanding**, the exact point
+the microbenchmark said triples throughput. Both slots keep the two-level shared+global stack.
+Guarded at runtime by `n12_fits(seq_len)`: the 33-bit packing holds only to a ~4.29 Gbp reference,
+and silently truncating k or l would corrupt the search, so a larger genome falls back.
+
+Target configuration achieved exactly -- 8 warps/SM, flag rate **0.520%**, identical to single:
+
+| engine | kernel | reconcile | end-to-end |
+|---|---|---|---|
+| DUAL 12-byte | 2.123 s | 0.464 s | 37,776 reads/s |
+| SINGLE | **1.857 s** | 0.444 s | **42,365 reads/s** |
+
+**Still 14% slower.** ptxas: 0 B stack frame, 127 registers. Bit-exact: sub2k `4b068014`,
+sub10k `54410c75`, sub100k `eecf35c1`.
+
+### Verdict: closed, with the strongest evidence available
+The microbenchmark's 3x does not transfer, because the kernel is not a pure gather loop. Running
+two slots doubles the per-iteration non-memory work -- two stack maintenance passes, two prune/hit
+tests, two child-generation double-passes, two 5-step warp prefix-sums -- to double memory
+parallelism. On a kernel whose measured compute throughput is only 16.7% but whose shared-memory
+and shuffle traffic is substantial, that trade loses.
+
+Three attempts (Phase 9 NPL=2, Phase 18, Phase 19) all failed. Phase 19 is decisive in a way the
+first two were not: it reached the exact configuration the measurement pointed at, with the flag
+rate matched, and still lost. **Per-lane MLP is not the lever for this kernel. Do not retry it.**
+
+What survives: the 12-byte node packing itself is validated and bit-exact, should a future design
+need 40% less stack memory. `cuda/dual_engine.cuh` is opt-in (`GPUALN_DUAL=1`); production is
+untouched.

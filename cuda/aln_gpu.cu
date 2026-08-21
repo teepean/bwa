@@ -60,6 +60,7 @@ extern char *bwa_pg;   /* @PG line printed by bwa_print_sam_hdr if set */
 #include "fm_device.cuh"
 #include "dfs_engine.cuh"
 #include "scheme_engine.cuh"
+#include "dual_engine.cuh"
 
 #define CK(call) do { cudaError_t e_ = (call); if (e_ != cudaSuccess) { \
 	fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); exit(1); } } while (0)
@@ -85,7 +86,7 @@ struct GpuCtx {
 	fmidx_dev fm;
 	int nblocks, bdim, wpb, CAP_SM, CAP_GL;
 	size_t shbytes;
-	uint64_t *Gk, *Gl; uint32_t *Gn;
+	uint64_t *Gk, *Gl; uint32_t *Gn; uint32_t *Gdual;
 	uint8_t *d_seq; uint64_t *d_ww; int *d_wbid; ReadParam *d_rp;
 	uint8_t *d_hit; unsigned long long *d_npop; int *d_wc, *d_nflag, *d_nprefilt;
 	uint8_t *d_flag; int *d_order;
@@ -120,17 +121,26 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 	 * (CAP_SM=128 produced a WRONG .sai). Enforce it rather than trusting the caller. */
 	if (CAP_SM < 256) { fprintf(stderr, "[aln-gpu] CAP_SM=%d too small (must be >= 256)\n", CAP_SM); return 1; }
 	if (CAP_GL < 256 || (CAP_GL % 128)) { fprintf(stderr, "[aln-gpu] CAP_GL=%d invalid (>=256, multiple of 128)\n", CAP_GL); return 1; }
+	/* the dual engine packs k and l into 33 bits each; that holds only up to a ~4.29 Gbp reference */
+	int dual_guard_pending = 1;
 	unsigned long long budget = getenv("DFS_BUDGET") ? strtoull(getenv("DFS_BUDGET"),NULL,10) : 2000000ULL;
 	int use_prefilter = getenv("DFS_NOPREFILTER") ? 0 : 1;
 	int nT = opt->n_threads > 0 ? opt->n_threads : 1;
 	int do_histo = getenv("GPUALN_HISTO") != NULL;
 	int use_order = getenv("GPUALN_NOORDER") ? 0 : 1;
-	int use_scheme = getenv("GPUALN_SCHEME") ? 1 : 0;   /* bidirectional search-scheme engine */   /* longest-first scheduling (A/B knob) */   /* opt-in per-length-band node-pop/flag histogram */
+	int use_scheme = getenv("GPUALN_SCHEME") ? 1 : 0;
+	int use_dual = getenv("GPUALN_DUAL") ? 1 : 0;   /* two reads/warp -> per-lane MLP=2 */   /* bidirectional search-scheme engine */   /* longest-first scheduling (A/B knob) */   /* opt-in per-length-band node-pop/flag histogram */
 
 	char bwt_fn[4096]; snprintf(bwt_fn, sizeof bwt_fn, "%s.bwt", prefix);
 	fprintf(stderr, "[aln-gpu] loading %s\n", bwt_fn);
 	bwt_t *bwt = bwt_restore_bwt(bwt_fn);
 	if (!bwt) { fprintf(stderr, "failed to load bwt\n"); return 1; }
+	if (use_dual && !n12_fits(bwt->seq_len)) {
+		fprintf(stderr, "[aln-gpu] GPUALN_DUAL needs seq_len < 2^33 (have %llu); falling back to the 20-byte engine\n",
+		        (unsigned long long)bwt->seq_len);
+		use_dual = 0;
+	}
+	(void)dual_guard_pending;
 
 	/* multi-GPU init: detect devices, upload BWT + allocate backing on each */
 	int nGpu = 0; CK(cudaGetDeviceCount(&nGpu));
@@ -149,9 +159,14 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 		gx.fm = fmidx_dev{ db, bwt->primary, bwt->seq_len };
 		int numSM = 0; CK(cudaDeviceGetAttribute(&numSM, cudaDevAttrMultiProcessorCount, g));
 		gx.bdim = wpb * 32;
-		gx.shbytes = (size_t)wpb * CAP_SM * (use_scheme ? sizeof(SNode) : 20);
+		/* dual: two 12-byte-node stacks per warp; that is what buys 2 reads/warp at 8 warps/SM */
+		gx.shbytes = use_dual ? (size_t)wpb * 2 * CAP_SM * 12
+		                      : (size_t)wpb * CAP_SM * (use_scheme ? sizeof(SNode) : 20);
 		int mb = 0;
-		if (use_scheme) {
+		if (use_dual) {
+			CK(cudaFuncSetAttribute(k_dfs_warp2_dual, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gx.shbytes));
+			CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mb, k_dfs_warp2_dual, gx.bdim, gx.shbytes));
+		} else if (use_scheme) {
 			if (sch_upload(g == 0)) { fprintf(stderr, "[scheme] table validation FAILED\n"); return 1; }
 			CK(cudaFuncSetAttribute(k_dfs_scheme, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gx.shbytes));
 			CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mb, k_dfs_scheme, gx.bdim, gx.shbytes));
@@ -161,14 +176,16 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 		}
 		gx.nblocks = mb > 0 ? mb * numSM : numSM;
 		size_t nwarps = (size_t)gx.nblocks * wpb;
-		CK(cudaMalloc(&gx.Gk, nwarps*CAP_GL*8)); CK(cudaMalloc(&gx.Gl, nwarps*CAP_GL*8)); CK(cudaMalloc(&gx.Gn, nwarps*CAP_GL*4));
+		gx.Gdual = NULL;
+		if (use_dual) CK(cudaMalloc(&gx.Gdual, nwarps*2*(size_t)CAP_GL*3*4));
+		else { CK(cudaMalloc(&gx.Gk, nwarps*CAP_GL*8)); CK(cudaMalloc(&gx.Gl, nwarps*CAP_GL*8)); CK(cudaMalloc(&gx.Gn, nwarps*CAP_GL*4)); }
 		gx.d_seq=NULL; gx.d_ww=NULL; gx.d_wbid=NULL; gx.d_rp=NULL;
 		gx.d_hit=NULL; gx.d_npop=NULL; gx.d_wc=NULL; gx.d_nflag=NULL; gx.d_nprefilt=NULL; gx.d_flag=NULL; gx.d_order=NULL;
 		gx.cap_seq=0; gx.cap_w=0; gx.cap_n=0;
 		char name[256]; cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, g));
 		snprintf(name, sizeof name, "%s", prop.name);
 		fprintf(stderr, "[aln-gpu] GPU %d (%s): %d SM, %d blk/SM x %d warps, backing %.0f MB\n",
-			g, name, numSM, mb, mb*wpb, nwarps*CAP_GL*20.0/1e6);
+			g, name, numSM, mb, mb*wpb, nwarps*CAP_GL*(use_dual?24.0:20.0)/1e6);
 	}
 	fprintf(stderr, "[aln-gpu] %d GPU(s), CAP_SM=%d CAP_GL=%d; %d CPU threads\n", nGpu, CAP_SM, CAP_GL, nT);
 
@@ -247,7 +264,12 @@ extern "C" int bwa_alnse_gpu(int argc, char **argv)
 			CK(cudaMemcpy(gx.d_order, c->order.data(), nseq*4, cudaMemcpyHostToDevice));
 			CK(cudaMemset(gx.d_wc,0,4)); CK(cudaMemset(gx.d_nflag,0,4)); CK(cudaMemset(gx.d_nprefilt,0,4));
 			double _gk0 = now_s();
-			if (use_scheme)
+			if (use_dual)
+				k_dfs_warp2_dual<<<gx.nblocks, gx.bdim, gx.shbytes>>>(gx.fm, gx.d_seq, gx.d_ww, gx.d_wbid, gx.d_rp, nseq,
+					c->base.max_gapo, c->base.max_gape, c->base.mode, c->base.indel_end_skip, c->base.max_del_occ,
+					gx.CAP_SM, gx.CAP_GL, gx.Gdual, gx.d_hit, gx.d_wc, gx.d_npop, budget, gx.d_nflag, gx.wpb,
+					gx.d_flag, use_order ? gx.d_order : NULL);
+			else if (use_scheme)
 				k_dfs_scheme<<<gx.nblocks, gx.bdim, gx.shbytes>>>(gx.fm, gx.d_seq, gx.d_ww, gx.d_wbid, gx.d_rp, nseq,
 					c->base.max_gapo, c->base.max_gape, c->base.mode, c->base.indel_end_skip, c->base.max_del_occ,
 					gx.CAP_SM, gx.CAP_GL, gx.Gk, gx.Gl, gx.Gn, gx.d_hit, gx.d_wc, gx.d_npop, budget, gx.d_nflag,
